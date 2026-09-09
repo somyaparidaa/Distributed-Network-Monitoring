@@ -3,16 +3,17 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"math"
 	"math/rand"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
 
 const (
-	deviceID          = "router-01"
 	maximumPercentage = 100.0
 	degradedThreshold = 30.0
 
@@ -54,6 +55,12 @@ type SimulationConfig struct {
 	DegradationProbability float64
 }
 
+// DeviceConfig identifies one independently simulated device.
+type DeviceConfig struct {
+	DeviceID   string
+	Simulation SimulationConfig
+}
+
 func DefaultSimulationConfig() SimulationConfig {
 	return SimulationConfig{
 		UpdateInterval:         time.Second,
@@ -71,11 +78,7 @@ type Simulator struct {
 	degradation float64
 }
 
-func NewSimulator() *Simulator {
-	return NewSimulatorWithConfig(DefaultSimulationConfig())
-}
-
-func NewSimulatorWithConfig(config SimulationConfig) *Simulator {
+func NewSimulator(deviceID string, config SimulationConfig) *Simulator {
 	if config.UpdateInterval <= 0 {
 		config.UpdateInterval = time.Second
 	}
@@ -95,6 +98,49 @@ func NewSimulatorWithConfig(config SimulationConfig) *Simulator {
 		},
 		config: config,
 		rng:    rand.New(rand.NewSource(config.Seed)),
+	}
+}
+
+// Fleet manages independent device simulators.
+type Fleet struct {
+	devices map[string]*Simulator
+}
+
+func NewFleet(configs []DeviceConfig) (*Fleet, error) {
+	fleet := &Fleet{devices: make(map[string]*Simulator, len(configs))}
+	for _, config := range configs {
+		if config.DeviceID == "" {
+			return nil, fmt.Errorf("device ID cannot be empty")
+		}
+		if _, exists := fleet.devices[config.DeviceID]; exists {
+			return nil, fmt.Errorf("duplicate device ID %q", config.DeviceID)
+		}
+		fleet.devices[config.DeviceID] = NewSimulator(config.DeviceID, config.Simulation)
+	}
+	return fleet, nil
+}
+
+func NewDefaultFleet() (*Fleet, error) {
+	return NewFleet([]DeviceConfig{
+		{DeviceID: "router-01", Simulation: SimulationConfig{UpdateInterval: time.Second, Seed: 101, DegradationProbability: 0.08}},
+		{DeviceID: "router-02", Simulation: SimulationConfig{UpdateInterval: time.Second, Seed: 202, DegradationProbability: 0.08}},
+		{DeviceID: "router-03", Simulation: SimulationConfig{UpdateInterval: time.Second, Seed: 303, DegradationProbability: 0.08}},
+	})
+}
+
+func (f *Fleet) Device(deviceID string) (*Simulator, bool) {
+	device, exists := f.devices[deviceID]
+	return device, exists
+}
+
+func (f *Fleet) Len() int {
+	return len(f.devices)
+}
+
+// Run starts an update loop for every device in the fleet.
+func (f *Fleet) Run(ctx context.Context) {
+	for _, device := range f.devices {
+		go device.Run(ctx)
 	}
 }
 
@@ -167,6 +213,21 @@ func (s *Simulator) metricsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (f *Fleet) metricsHandler(w http.ResponseWriter, r *http.Request) {
+	deviceID := strings.TrimPrefix(r.URL.Path, "/metrics/")
+	if deviceID == "" || strings.Contains(deviceID, "/") {
+		http.NotFound(w, r)
+		return
+	}
+
+	device, exists := f.Device(deviceID)
+	if !exists {
+		http.NotFound(w, r)
+		return
+	}
+	device.metricsHandler(w, r)
+}
+
 func nextMetric(current, target, maximumStep, min, max float64) float64 {
 	change := clamp(target-current, -maximumStep, maximumStep)
 	return clamp(current+change, min, max)
@@ -183,11 +244,17 @@ func clamp(value, min, max float64) float64 {
 }
 
 func main() {
-	simulator := NewSimulator()
-	go simulator.Run(context.Background())
+	fleet, err := NewDefaultFleet()
+	if err != nil {
+		log.Fatalf("create fleet: %v", err)
+	}
+	go fleet.Run(context.Background())
+
+	primaryDevice, _ := fleet.Device("router-01")
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/metrics", simulator.metricsHandler)
+	mux.HandleFunc("/metrics", primaryDevice.metricsHandler)
+	mux.HandleFunc("/metrics/", fleet.metricsHandler)
 
 	server := &http.Server{Addr: ":8080", Handler: mux}
 	log.Println("simulator for router-01 listening on :8080")

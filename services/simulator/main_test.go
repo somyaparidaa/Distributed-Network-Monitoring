@@ -12,11 +12,11 @@ import (
 )
 
 func TestNewSimulatorInitialState(t *testing.T) {
-	simulator := NewSimulator()
+	simulator := NewSimulator("router-01", DefaultSimulationConfig())
 	telemetry := simulator.currentTelemetry()
 
-	if telemetry.DeviceID != deviceID {
-		t.Fatalf("device ID = %q, want %q", telemetry.DeviceID, deviceID)
+	if telemetry.DeviceID != "router-01" {
+		t.Fatalf("device ID = %q, want router-01", telemetry.DeviceID)
 	}
 	if telemetry.Condition != ConditionNormal {
 		t.Fatalf("condition = %q, want %q", telemetry.Condition, ConditionNormal)
@@ -33,7 +33,7 @@ func TestNewSimulatorInitialState(t *testing.T) {
 }
 
 func TestUpdateRefreshesStateWithinValidRanges(t *testing.T) {
-	simulator := NewSimulator()
+	simulator := NewSimulator("router-01", DefaultSimulationConfig())
 	before := simulator.currentTelemetry()
 	time.Sleep(time.Millisecond)
 	simulator.update()
@@ -46,7 +46,7 @@ func TestUpdateRefreshesStateWithinValidRanges(t *testing.T) {
 }
 
 func TestSimulationLoopUpdatesState(t *testing.T) {
-	simulator := NewSimulatorWithConfig(SimulationConfig{
+	simulator := NewSimulator("router-01", SimulationConfig{
 		UpdateInterval:         10 * time.Millisecond,
 		Seed:                   1,
 		DegradationProbability: 0,
@@ -64,7 +64,7 @@ func TestSimulationLoopUpdatesState(t *testing.T) {
 }
 
 func TestMetricsHandlerReturnsCurrentState(t *testing.T) {
-	simulator := NewSimulator()
+	simulator := NewSimulator("router-01", DefaultSimulationConfig())
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodGet, "/metrics", nil)
 
@@ -87,7 +87,7 @@ func TestMetricsHandlerReturnsCurrentState(t *testing.T) {
 }
 
 func TestConditionBecomesDegradedAtThreshold(t *testing.T) {
-	simulator := NewSimulatorWithConfig(SimulationConfig{
+	simulator := NewSimulator("router-01", SimulationConfig{
 		UpdateInterval:         time.Second,
 		Seed:                   1,
 		DegradationProbability: 1,
@@ -106,7 +106,7 @@ func TestConditionBecomesDegradedAtThreshold(t *testing.T) {
 }
 
 func TestMetricsHandlerExposesCondition(t *testing.T) {
-	simulator := NewSimulatorWithConfig(SimulationConfig{
+	simulator := NewSimulator("router-01", SimulationConfig{
 		UpdateInterval:         time.Second,
 		Seed:                   1,
 		DegradationProbability: 1,
@@ -126,8 +126,90 @@ func TestMetricsHandlerExposesCondition(t *testing.T) {
 	}
 }
 
+func TestFleetCreatesIndependentDevices(t *testing.T) {
+	fleet := newTestFleet(t)
+	if fleet.Len() != 3 {
+		t.Fatalf("fleet size = %d, want 3", fleet.Len())
+	}
+
+	seen := make(map[string]bool)
+	for _, deviceID := range []string{"router-01", "router-02", "router-03"} {
+		device, exists := fleet.Device(deviceID)
+		if !exists {
+			t.Fatalf("missing device %q", deviceID)
+		}
+		telemetry := device.currentTelemetry()
+		if telemetry.DeviceID != deviceID {
+			t.Errorf("device ID = %q, want %q", telemetry.DeviceID, deviceID)
+		}
+		if seen[telemetry.DeviceID] {
+			t.Errorf("duplicate telemetry device ID %q", telemetry.DeviceID)
+		}
+		seen[telemetry.DeviceID] = true
+	}
+}
+
+func TestUpdatingOneFleetDeviceDoesNotChangeAnother(t *testing.T) {
+	fleet := newTestFleet(t)
+	routerOne, _ := fleet.Device("router-01")
+	routerTwo, _ := fleet.Device("router-02")
+	before := routerTwo.currentTelemetry()
+
+	routerOne.update()
+
+	if after := routerTwo.currentTelemetry(); after != before {
+		t.Fatalf("router-02 changed after router-01 update: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestFleetDevicesUseIndependentDeterministicSeeds(t *testing.T) {
+	fleet := newTestFleet(t)
+	routerOne, _ := fleet.Device("router-01")
+	routerTwo, _ := fleet.Device("router-02")
+	routerThree, _ := fleet.Device("router-03")
+
+	if routerOne.config.Seed == routerTwo.config.Seed || routerOne.config.Seed == routerThree.config.Seed || routerTwo.config.Seed == routerThree.config.Seed {
+		t.Fatal("fleet devices must use different seeds")
+	}
+
+	for range 10 {
+		routerOne.update()
+		routerTwo.update()
+		routerThree.update()
+	}
+
+	first := routerOne.currentTelemetry()
+	second := routerTwo.currentTelemetry()
+	third := routerThree.currentTelemetry()
+	if first.CPU == second.CPU && second.CPU == third.CPU && first.Memory == second.Memory && second.Memory == third.Memory {
+		t.Fatal("independently seeded devices produced identical telemetry")
+	}
+	assertValidTelemetry(t, first)
+	assertValidTelemetry(t, second)
+	assertValidTelemetry(t, third)
+}
+
+func TestFleetMetricsHandlerReturnsRequestedDevice(t *testing.T) {
+	fleet := newTestFleet(t)
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/metrics/router-02", nil)
+
+	fleet.metricsHandler(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	var response Telemetry
+	if err := json.NewDecoder(w.Body).Decode(&response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response.DeviceID != "router-02" {
+		t.Fatalf("device ID = %q, want router-02", response.DeviceID)
+	}
+}
+
 func TestConcurrentStateAccess(t *testing.T) {
-	simulator := NewSimulator()
+	simulator := NewSimulator("router-01", DefaultSimulationConfig())
 	var wg sync.WaitGroup
 
 	for range 20 {
@@ -154,7 +236,7 @@ func TestConcurrentStateAccess(t *testing.T) {
 }
 
 func TestMetricsChangeGraduallyDuringNormalOperation(t *testing.T) {
-	simulator := NewSimulatorWithConfig(SimulationConfig{
+	simulator := NewSimulator("router-01", SimulationConfig{
 		UpdateInterval:         time.Second,
 		Seed:                   42,
 		DegradationProbability: 0,
@@ -183,7 +265,7 @@ func TestMetricsChangeGraduallyDuringNormalOperation(t *testing.T) {
 }
 
 func TestDegradationAffectsRelatedMetrics(t *testing.T) {
-	simulator := NewSimulatorWithConfig(SimulationConfig{
+	simulator := NewSimulator("router-01", SimulationConfig{
 		UpdateInterval:         time.Second,
 		Seed:                   7,
 		DegradationProbability: 1,
@@ -205,8 +287,8 @@ func TestDegradationAffectsRelatedMetrics(t *testing.T) {
 
 func TestSeededSimulationIsDeterministic(t *testing.T) {
 	config := SimulationConfig{UpdateInterval: time.Second, Seed: 99, DegradationProbability: 0.4}
-	first := NewSimulatorWithConfig(config)
-	second := NewSimulatorWithConfig(config)
+	first := NewSimulator("router-01", config)
+	second := NewSimulator("router-01", config)
 
 	for range 20 {
 		first.update()
@@ -226,9 +308,6 @@ func TestSeededSimulationIsDeterministic(t *testing.T) {
 
 func assertValidTelemetry(t *testing.T, telemetry Telemetry) {
 	t.Helper()
-	if telemetry.DeviceID != deviceID {
-		t.Errorf("device ID = %q, want %q", telemetry.DeviceID, deviceID)
-	}
 	if telemetry.Timestamp.IsZero() {
 		t.Error("telemetry timestamp is zero")
 	}
@@ -247,4 +326,17 @@ func assertValidTelemetry(t *testing.T, telemetry Telemetry) {
 	if telemetry.LatencyMS < 0 {
 		t.Errorf("latency = %d, must be non-negative", telemetry.LatencyMS)
 	}
+}
+
+func newTestFleet(t *testing.T) *Fleet {
+	t.Helper()
+	fleet, err := NewFleet([]DeviceConfig{
+		{DeviceID: "router-01", Simulation: SimulationConfig{UpdateInterval: time.Second, Seed: 11, DegradationProbability: 0.1}},
+		{DeviceID: "router-02", Simulation: SimulationConfig{UpdateInterval: time.Second, Seed: 22, DegradationProbability: 0.1}},
+		{DeviceID: "router-03", Simulation: SimulationConfig{UpdateInterval: time.Second, Seed: 33, DegradationProbability: 0.1}},
+	})
+	if err != nil {
+		t.Fatalf("create fleet: %v", err)
+	}
+	return fleet
 }
