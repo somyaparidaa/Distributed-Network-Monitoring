@@ -8,8 +8,11 @@ import (
 	"math"
 	"math/rand"
 	"net/http"
+	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -311,23 +314,79 @@ func clamp(value, min, max float64) float64 {
 	return value
 }
 
-func main() {
-	fleet, err := NewDefaultFleet()
-	if err != nil {
-		log.Fatalf("create fleet: %v", err)
+// NewMux constructs an http.Handler with all metrics and control routes for the fleet.
+func NewMux(fleet *Fleet) (http.Handler, error) {
+	primaryDevice, exists := fleet.Device("router-01")
+	if !exists {
+		return nil, fmt.Errorf("primary device router-01 not found in fleet")
 	}
-	go fleet.Run(context.Background())
-
-	primaryDevice, _ := fleet.Device("router-01")
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/metrics", primaryDevice.metricsHandler)
 	mux.HandleFunc("/metrics/", fleet.metricsHandler)
 	mux.HandleFunc("/control/", fleet.controlHandler)
+	return mux, nil
+}
 
-	server := &http.Server{Addr: ":8080", Handler: mux}
-	log.Println("simulator for router-01 listening on :8080")
-	if err := server.ListenAndServe(); err != nil {
-		log.Fatalf("server failed: %v", err)
+// Run starts the fleet simulation and HTTP server, shutting down gracefully on ctx cancellation.
+func Run(ctx context.Context, addr string, fleet *Fleet) error {
+	handler, err := NewMux(fleet)
+	if err != nil {
+		return fmt.Errorf("initialize mux: %w", err)
 	}
+
+	fleet.Run(ctx)
+
+	server := &http.Server{
+		Addr:    addr,
+		Handler: handler,
+	}
+
+	serverErr := make(chan error, 1)
+	go func() {
+		log.Printf("simulator listening on %s", addr)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			serverErr <- err
+		}
+		close(serverErr)
+	}()
+
+	select {
+	case err := <-serverErr:
+		return fmt.Errorf("server startup failed: %w", err)
+	case <-ctx.Done():
+		log.Println("shutdown signal received; terminating simulator server...")
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		return fmt.Errorf("graceful server shutdown failed: %w", err)
+	}
+
+	<-serverErr
+	log.Println("simulator server stopped gracefully")
+	return nil
+}
+
+func main() {
+	addr := os.Getenv("SIMULATOR_ADDR")
+	if addr == "" {
+		addr = ":8080"
+	}
+
+	fleet, err := NewDefaultFleet()
+	if err != nil {
+		log.Fatalf("create fleet: %v", err)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	log.Println("starting network device simulator fleet (router-01, router-02, router-03)...")
+	if err := Run(ctx, addr, fleet); err != nil {
+		log.Fatalf("simulator error: %v", err)
+	}
+	log.Println("simulator process shutdown complete")
 }

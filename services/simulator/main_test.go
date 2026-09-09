@@ -469,6 +469,151 @@ func assertValidTelemetry(t *testing.T, telemetry Telemetry) {
 	}
 }
 
+func TestNewMuxRequiresPrimaryDevice(t *testing.T) {
+	fleet, err := NewFleet([]DeviceConfig{
+		{DeviceID: "router-02", Simulation: SimulationConfig{UpdateInterval: time.Second, Seed: 22}},
+	})
+	if err != nil {
+		t.Fatalf("create fleet: %v", err)
+	}
+
+	if _, err := NewMux(fleet); err == nil {
+		t.Fatal("expected error when primary device router-01 is missing from fleet, got nil")
+	}
+}
+
+func TestHTTPHandlerEdgeCases(t *testing.T) {
+	fleet := newTestFleet(t)
+	handler, err := NewMux(fleet)
+	if err != nil {
+		t.Fatalf("NewMux failed: %v", err)
+	}
+
+	tests := []struct {
+		name           string
+		method         string
+		path           string
+		expectedStatus int
+	}{
+		{
+			name:           "primary metrics rejects non-GET",
+			method:         http.MethodPost,
+			path:           "/metrics",
+			expectedStatus: http.StatusMethodNotAllowed,
+		},
+		{
+			name:           "metrics trailing slash empty ID",
+			method:         http.MethodGet,
+			path:           "/metrics/",
+			expectedStatus: http.StatusNotFound,
+		},
+		{
+			name:           "metrics nested path rejected",
+			method:         http.MethodGet,
+			path:           "/metrics/router-01/extra",
+			expectedStatus: http.StatusNotFound,
+		},
+		{
+			name:           "metrics unknown device",
+			method:         http.MethodGet,
+			path:           "/metrics/router-99",
+			expectedStatus: http.StatusNotFound,
+		},
+		{
+			name:           "control endpoint non-POST rejected",
+			method:         http.MethodGet,
+			path:           "/control/router-01/down",
+			expectedStatus: http.StatusMethodNotAllowed,
+		},
+		{
+			name:           "control unknown device",
+			method:         http.MethodPost,
+			path:           "/control/router-99/down",
+			expectedStatus: http.StatusNotFound,
+		},
+		{
+			name:           "control unknown action",
+			method:         http.MethodPost,
+			path:           "/control/router-01/restart",
+			expectedStatus: http.StatusNotFound,
+		},
+		{
+			name:           "control missing action",
+			method:         http.MethodPost,
+			path:           "/control/router-01",
+			expectedStatus: http.StatusNotFound,
+		},
+		{
+			name:           "control extra subpath rejected",
+			method:         http.MethodPost,
+			path:           "/control/router-01/down/extra",
+			expectedStatus: http.StatusNotFound,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			r := httptest.NewRequest(tc.method, tc.path, nil)
+			handler.ServeHTTP(w, r)
+			if w.Code != tc.expectedStatus {
+				t.Fatalf("%s %s status = %d, want %d", tc.method, tc.path, w.Code, tc.expectedStatus)
+			}
+		})
+	}
+}
+
+func TestRecoveringOneDeviceDoesNotAffectAnother(t *testing.T) {
+	fleet := newTestFleet(t)
+	r1, _ := fleet.Device("router-01")
+	r2, _ := fleet.Device("router-02")
+
+	r1.SetDown(true)
+	r2.SetDown(true)
+
+	if !r1.IsDown() || !r2.IsDown() {
+		t.Fatal("both devices should be down")
+	}
+
+	// Recover r2 only
+	r2.SetDown(false)
+
+	if !r1.IsDown() {
+		t.Fatal("recovering router-02 must not recover router-01")
+	}
+	if r2.IsDown() {
+		t.Fatal("router-02 should be operational after recovery")
+	}
+}
+
+func TestRunServerGracefulShutdown(t *testing.T) {
+	fleet := newTestFleet(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	// Bind to an ephemeral port on loopback
+	go func() {
+		errCh <- Run(ctx, "127.0.0.1:0", fleet)
+	}()
+
+	// Allow server to start listening
+	time.Sleep(50 * time.Millisecond)
+
+	// Cancel context to initiate graceful shutdown
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("Run returned error on graceful shutdown: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run timed out waiting for graceful shutdown")
+	}
+}
+
 func newTestFleet(t *testing.T) *Fleet {
 	t.Helper()
 	fleet, err := NewFleet([]DeviceConfig{
