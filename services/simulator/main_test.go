@@ -21,6 +21,9 @@ func TestNewSimulatorInitialState(t *testing.T) {
 	if telemetry.Condition != ConditionNormal {
 		t.Fatalf("condition = %q, want %q", telemetry.Condition, ConditionNormal)
 	}
+	if simulator.IsDown() {
+		t.Fatal("new simulator is down")
+	}
 	if telemetry.CPU != normalCPU || telemetry.Memory != normalMemory || telemetry.LatencyMS != int(normalLatencyMS) || telemetry.PacketLoss != normalPacketLoss {
 		t.Fatalf("unexpected initial telemetry: %+v", telemetry)
 	}
@@ -208,6 +211,126 @@ func TestFleetMetricsHandlerReturnsRequestedDevice(t *testing.T) {
 	}
 }
 
+func TestSetDownStopsUpdatesAndRecoveryRestoresDevice(t *testing.T) {
+	simulator := NewSimulator("router-01", DefaultSimulationConfig())
+	simulator.SetDown(true)
+	downTelemetry := simulator.currentTelemetry()
+
+	if !simulator.IsDown() || downTelemetry.Condition != ConditionDown {
+		t.Fatalf("device was not marked down: %+v", downTelemetry)
+	}
+	if downTelemetry.InterfaceUp || downTelemetry.Connectivity {
+		t.Fatalf("down device remains operational: %+v", downTelemetry)
+	}
+	simulator.update()
+	if afterUpdate := simulator.currentTelemetry(); afterUpdate != downTelemetry {
+		t.Fatalf("down device telemetry changed: before=%+v after=%+v", downTelemetry, afterUpdate)
+	}
+
+	simulator.SetDown(false)
+	recovered := simulator.currentTelemetry()
+	if simulator.IsDown() || recovered.Condition != ConditionNormal {
+		t.Fatalf("device did not recover to normal: %+v", recovered)
+	}
+	if !recovered.InterfaceUp || !recovered.Connectivity {
+		t.Fatalf("recovered device remains unavailable: %+v", recovered)
+	}
+}
+
+func TestRecoveryUsesExistingDegradationCondition(t *testing.T) {
+	simulator := NewSimulator("router-01", DefaultSimulationConfig())
+	simulator.degradation = degradedThreshold
+	simulator.SetDown(true)
+	simulator.SetDown(false)
+
+	telemetry := simulator.currentTelemetry()
+	if telemetry.Condition != ConditionDegraded {
+		t.Fatalf("condition = %q, want %q", telemetry.Condition, ConditionDegraded)
+	}
+	if !telemetry.InterfaceUp || !telemetry.Connectivity {
+		t.Fatalf("recovered degraded device is unavailable: %+v", telemetry)
+	}
+}
+
+func TestDownDeviceMetricsReturnsServiceUnavailable(t *testing.T) {
+	simulator := NewSimulator("router-01", DefaultSimulationConfig())
+	simulator.SetDown(true)
+
+	w := httptest.NewRecorder()
+	simulator.metricsHandler(w, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusServiceUnavailable)
+	}
+
+	simulator.SetDown(false)
+	w = httptest.NewRecorder()
+	simulator.metricsHandler(w, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+}
+
+func TestFleetControlEndpoints(t *testing.T) {
+	fleet := newTestFleet(t)
+	w := httptest.NewRecorder()
+	fleet.controlHandler(w, httptest.NewRequest(http.MethodPost, "/control/router-02/down", nil))
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("down status = %d, want %d", w.Code, http.StatusNoContent)
+	}
+
+	w = httptest.NewRecorder()
+	fleet.metricsHandler(w, httptest.NewRequest(http.MethodGet, "/metrics/router-02", nil))
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("down metrics status = %d, want %d", w.Code, http.StatusServiceUnavailable)
+	}
+
+	w = httptest.NewRecorder()
+	fleet.controlHandler(w, httptest.NewRequest(http.MethodPost, "/control/router-02/recover", nil))
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("recover status = %d, want %d", w.Code, http.StatusNoContent)
+	}
+
+	w = httptest.NewRecorder()
+	fleet.metricsHandler(w, httptest.NewRequest(http.MethodGet, "/metrics/router-02", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("recovered metrics status = %d, want %d", w.Code, http.StatusOK)
+	}
+}
+
+func TestControlEndpointsRejectUnknownDevicesAndNonPostMethods(t *testing.T) {
+	fleet := newTestFleet(t)
+
+	w := httptest.NewRecorder()
+	fleet.controlHandler(w, httptest.NewRequest(http.MethodPost, "/control/router-99/down", nil))
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("unknown device status = %d, want %d", w.Code, http.StatusNotFound)
+	}
+
+	w = httptest.NewRecorder()
+	fleet.controlHandler(w, httptest.NewRequest(http.MethodGet, "/control/router-02/down", nil))
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET status = %d, want %d", w.Code, http.StatusMethodNotAllowed)
+	}
+}
+
+func TestDownFleetDeviceDoesNotAffectOtherDevices(t *testing.T) {
+	fleet := newTestFleet(t)
+	routerOne, _ := fleet.Device("router-01")
+	routerTwo, _ := fleet.Device("router-02")
+	routerThree, _ := fleet.Device("router-03")
+	beforeOne := routerOne.currentTelemetry()
+	beforeThree := routerThree.currentTelemetry()
+
+	routerTwo.SetDown(true)
+
+	if routerOne.IsDown() || routerThree.IsDown() {
+		t.Fatal("down state leaked to another fleet device")
+	}
+	if routerOne.currentTelemetry() != beforeOne || routerThree.currentTelemetry() != beforeThree {
+		t.Fatal("telemetry changed for an unaffected fleet device")
+	}
+}
+
 func TestConcurrentStateAccess(t *testing.T) {
 	simulator := NewSimulator("router-01", DefaultSimulationConfig())
 	var wg sync.WaitGroup
@@ -218,6 +341,15 @@ func TestConcurrentStateAccess(t *testing.T) {
 			defer wg.Done()
 			for range 100 {
 				simulator.update()
+			}
+		}()
+	}
+	for range 10 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range 100 {
+				simulator.SetDown(i%2 == 0)
 			}
 		}()
 	}
@@ -311,7 +443,16 @@ func assertValidTelemetry(t *testing.T, telemetry Telemetry) {
 	if telemetry.Timestamp.IsZero() {
 		t.Error("telemetry timestamp is zero")
 	}
-	if telemetry.Condition != ConditionNormal && telemetry.Condition != ConditionDegraded {
+	switch telemetry.Condition {
+	case ConditionNormal, ConditionDegraded:
+		if !telemetry.InterfaceUp || !telemetry.Connectivity {
+			t.Errorf("operational device is unavailable: %+v", telemetry)
+		}
+	case ConditionDown:
+		if telemetry.InterfaceUp || telemetry.Connectivity {
+			t.Errorf("down device is operational: %+v", telemetry)
+		}
+	default:
 		t.Errorf("unexpected condition %q", telemetry.Condition)
 	}
 	if telemetry.CPU < 0 || telemetry.CPU > maximumPercentage {

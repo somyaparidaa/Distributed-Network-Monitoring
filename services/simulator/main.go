@@ -33,6 +33,7 @@ type DeviceCondition string
 const (
 	ConditionNormal   DeviceCondition = "NORMAL"
 	ConditionDegraded DeviceCondition = "DEGRADED"
+	ConditionDown     DeviceCondition = "DOWN"
 )
 
 // Telemetry is a point-in-time snapshot of simulated router health.
@@ -76,6 +77,7 @@ type Simulator struct {
 	config      SimulationConfig
 	rng         *rand.Rand
 	degradation float64
+	down        bool
 }
 
 func NewSimulator(deviceID string, config SimulationConfig) *Simulator {
@@ -162,6 +164,9 @@ func (s *Simulator) Run(ctx context.Context) {
 func (s *Simulator) update() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.down {
+		return
+	}
 
 	s.advanceDegradation()
 
@@ -172,6 +177,31 @@ func (s *Simulator) update() {
 	s.telemetry.PacketLoss = nextMetric(s.telemetry.PacketLoss, normalPacketLoss+s.degradation*0.6+s.randomRange(-0.1, 0.4), maximumPacketLossStep, 0, maximumPercentage)
 	s.telemetry.Condition = conditionForDegradation(s.degradation)
 	s.telemetry.Timestamp = time.Now().UTC()
+}
+
+// SetDown injects or clears a device failure without stopping its update loop.
+func (s *Simulator) SetDown(down bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.down = down
+	if down {
+		s.telemetry.Condition = ConditionDown
+		s.telemetry.InterfaceUp = false
+		s.telemetry.Connectivity = false
+	} else {
+		s.telemetry.Condition = conditionForDegradation(s.degradation)
+		s.telemetry.InterfaceUp = true
+		s.telemetry.Connectivity = true
+	}
+	s.telemetry.Timestamp = time.Now().UTC()
+}
+
+func (s *Simulator) IsDown() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	return s.down
 }
 
 func conditionForDegradation(degradation float64) DeviceCondition {
@@ -207,8 +237,14 @@ func (s *Simulator) metricsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	telemetry := s.currentTelemetry()
+	if telemetry.Condition == ConditionDown {
+		http.Error(w, "device is down", http.StatusServiceUnavailable)
+		return
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(s.currentTelemetry()); err != nil {
+	if err := json.NewEncoder(w).Encode(telemetry); err != nil {
 		log.Printf("encode telemetry response: %v", err)
 	}
 }
@@ -226,6 +262,38 @@ func (f *Fleet) metricsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	device.metricsHandler(w, r)
+}
+
+func (f *Fleet) controlHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	path := strings.TrimPrefix(r.URL.Path, "/control/")
+	parts := strings.Split(path, "/")
+	if len(parts) != 2 || parts[0] == "" {
+		http.NotFound(w, r)
+		return
+	}
+
+	device, exists := f.Device(parts[0])
+	if !exists {
+		http.NotFound(w, r)
+		return
+	}
+
+	switch parts[1] {
+	case "down":
+		device.SetDown(true)
+	case "recover":
+		device.SetDown(false)
+	default:
+		http.NotFound(w, r)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func nextMetric(current, target, maximumStep, min, max float64) float64 {
@@ -255,6 +323,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/metrics", primaryDevice.metricsHandler)
 	mux.HandleFunc("/metrics/", fleet.metricsHandler)
+	mux.HandleFunc("/control/", fleet.controlHandler)
 
 	server := &http.Server{Addr: ":8080", Handler: mux}
 	log.Println("simulator for router-01 listening on :8080")
