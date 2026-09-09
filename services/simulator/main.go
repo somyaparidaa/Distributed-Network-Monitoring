@@ -14,6 +14,7 @@ import (
 const (
 	deviceID          = "router-01"
 	maximumPercentage = 100.0
+	degradedThreshold = 30.0
 
 	normalCPU        = 35.0
 	normalMemory     = 50.0
@@ -26,16 +27,24 @@ const (
 	maximumPacketLossStep = 0.5
 )
 
+type DeviceCondition string
+
+const (
+	ConditionNormal   DeviceCondition = "NORMAL"
+	ConditionDegraded DeviceCondition = "DEGRADED"
+)
+
 // Telemetry is a point-in-time snapshot of simulated router health.
 type Telemetry struct {
-	DeviceID     string    `json:"device_id"`
-	CPU          float64   `json:"cpu"`
-	Memory       float64   `json:"memory"`
-	LatencyMS    int       `json:"latency_ms"`
-	PacketLoss   float64   `json:"packet_loss"`
-	InterfaceUp  bool      `json:"interface_up"`
-	Connectivity bool      `json:"connectivity"`
-	Timestamp    time.Time `json:"timestamp"`
+	DeviceID     string          `json:"device_id"`
+	Condition    DeviceCondition `json:"condition"`
+	CPU          float64         `json:"cpu"`
+	Memory       float64         `json:"memory"`
+	LatencyMS    int             `json:"latency_ms"`
+	PacketLoss   float64         `json:"packet_loss"`
+	InterfaceUp  bool            `json:"interface_up"`
+	Connectivity bool            `json:"connectivity"`
+	Timestamp    time.Time       `json:"timestamp"`
 }
 
 // SimulationConfig controls the repeatability and timing of a simulator.
@@ -75,6 +84,7 @@ func NewSimulatorWithConfig(config SimulationConfig) *Simulator {
 	return &Simulator{
 		telemetry: Telemetry{
 			DeviceID:     deviceID,
+			Condition:    ConditionNormal,
 			CPU:          normalCPU,
 			Memory:       normalMemory,
 			LatencyMS:    int(normalLatencyMS),
@@ -114,7 +124,15 @@ func (s *Simulator) update() {
 	latency := nextMetric(float64(s.telemetry.LatencyMS), normalLatencyMS+s.degradation*3+s.randomRange(-3, 3), maximumLatencyStepMS, 0, math.MaxInt)
 	s.telemetry.LatencyMS = int(math.Round(latency))
 	s.telemetry.PacketLoss = nextMetric(s.telemetry.PacketLoss, normalPacketLoss+s.degradation*0.6+s.randomRange(-0.1, 0.4), maximumPacketLossStep, 0, maximumPercentage)
+	s.telemetry.Condition = conditionForDegradation(s.degradation)
 	s.telemetry.Timestamp = time.Now().UTC()
+}
+
+func conditionForDegradation(degradation float64) DeviceCondition {
+	if degradation >= degradedThreshold {
+		return ConditionDegraded
+	}
+	return ConditionNormal
 }
 
 func (s *Simulator) advanceDegradation() {

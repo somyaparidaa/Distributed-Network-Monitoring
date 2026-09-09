@@ -18,6 +18,9 @@ func TestNewSimulatorInitialState(t *testing.T) {
 	if telemetry.DeviceID != deviceID {
 		t.Fatalf("device ID = %q, want %q", telemetry.DeviceID, deviceID)
 	}
+	if telemetry.Condition != ConditionNormal {
+		t.Fatalf("condition = %q, want %q", telemetry.Condition, ConditionNormal)
+	}
 	if telemetry.CPU != normalCPU || telemetry.Memory != normalMemory || telemetry.LatencyMS != int(normalLatencyMS) || telemetry.PacketLoss != normalPacketLoss {
 		t.Fatalf("unexpected initial telemetry: %+v", telemetry)
 	}
@@ -80,6 +83,46 @@ func TestMetricsHandlerReturnsCurrentState(t *testing.T) {
 	}
 	if response != simulator.currentTelemetry() {
 		t.Fatalf("response = %+v, want current state %+v", response, simulator.currentTelemetry())
+	}
+}
+
+func TestConditionBecomesDegradedAtThreshold(t *testing.T) {
+	simulator := NewSimulatorWithConfig(SimulationConfig{
+		UpdateInterval:         time.Second,
+		Seed:                   1,
+		DegradationProbability: 1,
+	})
+	simulator.degradation = degradedThreshold - 1
+
+	simulator.update()
+	telemetry := simulator.currentTelemetry()
+
+	if telemetry.Condition != ConditionDegraded {
+		t.Fatalf("condition = %q, want %q", telemetry.Condition, ConditionDegraded)
+	}
+	if !telemetry.InterfaceUp || !telemetry.Connectivity {
+		t.Fatalf("degraded device should remain reachable: %+v", telemetry)
+	}
+}
+
+func TestMetricsHandlerExposesCondition(t *testing.T) {
+	simulator := NewSimulatorWithConfig(SimulationConfig{
+		UpdateInterval:         time.Second,
+		Seed:                   1,
+		DegradationProbability: 1,
+	})
+	simulator.degradation = degradedThreshold
+	simulator.update()
+
+	w := httptest.NewRecorder()
+	simulator.metricsHandler(w, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+
+	var response Telemetry
+	if err := json.NewDecoder(w.Body).Decode(&response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response.Condition != ConditionDegraded {
+		t.Fatalf("condition = %q, want %q", response.Condition, ConditionDegraded)
 	}
 }
 
@@ -155,6 +198,9 @@ func TestDegradationAffectsRelatedMetrics(t *testing.T) {
 	if after.CPU <= before.CPU || after.Memory <= before.Memory || after.LatencyMS <= before.LatencyMS || after.PacketLoss <= before.PacketLoss {
 		t.Fatalf("degradation did not raise related metrics: before=%+v after=%+v", before, after)
 	}
+	if after.Condition != ConditionDegraded {
+		t.Fatalf("condition = %q, want %q", after.Condition, ConditionDegraded)
+	}
 }
 
 func TestSeededSimulationIsDeterministic(t *testing.T) {
@@ -171,7 +217,8 @@ func TestSeededSimulationIsDeterministic(t *testing.T) {
 		if firstTelemetry.CPU != secondTelemetry.CPU ||
 			firstTelemetry.Memory != secondTelemetry.Memory ||
 			firstTelemetry.LatencyMS != secondTelemetry.LatencyMS ||
-			firstTelemetry.PacketLoss != secondTelemetry.PacketLoss {
+			firstTelemetry.PacketLoss != secondTelemetry.PacketLoss ||
+			firstTelemetry.Condition != secondTelemetry.Condition {
 			t.Fatalf("seeded simulations diverged: first=%+v second=%+v", firstTelemetry, secondTelemetry)
 		}
 	}
@@ -184,6 +231,9 @@ func assertValidTelemetry(t *testing.T, telemetry Telemetry) {
 	}
 	if telemetry.Timestamp.IsZero() {
 		t.Error("telemetry timestamp is zero")
+	}
+	if telemetry.Condition != ConditionNormal && telemetry.Condition != ConditionDegraded {
+		t.Errorf("unexpected condition %q", telemetry.Condition)
 	}
 	if telemetry.CPU < 0 || telemetry.CPU > maximumPercentage {
 		t.Errorf("CPU = %f, outside 0-%f", telemetry.CPU, maximumPercentage)
