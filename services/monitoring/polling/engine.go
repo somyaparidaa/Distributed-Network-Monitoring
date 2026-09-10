@@ -20,6 +20,11 @@ type HealthEvaluator interface {
 	RecordPollFailure(deviceID string, isTransportDown bool)
 }
 
+// TelemetryPublisher publishes telemetry events to external streaming systems (Kafka).
+type TelemetryPublisher interface {
+	PublishTelemetry(ctx context.Context, t Telemetry)
+}
+
 // EngineConfig aggregates tuning parameters for the polling engine.
 type EngineConfig struct {
 	PollInterval     time.Duration
@@ -34,6 +39,7 @@ type Engine struct {
 	stateTracker *StateTracker
 	client       Poller
 	healthEval   HealthEvaluator
+	telemPub     TelemetryPublisher
 	config       EngineConfig
 	wg           sync.WaitGroup
 }
@@ -64,6 +70,11 @@ func NewEngine(
 // SetHealthEvaluator attaches a health evaluator to the engine.
 func (e *Engine) SetHealthEvaluator(eval HealthEvaluator) {
 	e.healthEval = eval
+}
+
+// SetTelemetryPublisher attaches an event publisher for telemetry.
+func (e *Engine) SetTelemetryPublisher(pub TelemetryPublisher) {
+	e.telemPub = pub
 }
 
 // Start launches a dedicated polling goroutine for each configured device.
@@ -130,5 +141,9 @@ func (e *Engine) pollOnce(ctx context.Context, dev device.MonitoredDevice) {
 
 	if e.healthEval != nil {
 		e.healthEval.RecordPollSuccess(dev.ID, telemetry)
+	}
+
+	if e.telemPub != nil {
+		e.telemPub.PublishTelemetry(ctx, telemetry)
 	}
 }

@@ -10,6 +10,7 @@ import (
 
 	"distributed-network-monitor/services/monitoring/device"
 	"distributed-network-monitor/services/monitoring/health"
+	"distributed-network-monitor/services/monitoring/kafka"
 	"distributed-network-monitor/services/monitoring/polling"
 )
 
@@ -19,6 +20,7 @@ type Service struct {
 	store        *polling.Store
 	healthStore  *health.Store
 	stateTracker *polling.StateTracker
+	producer     kafka.Producer
 	engine       *polling.Engine
 }
 
@@ -34,6 +36,19 @@ func NewService(cfg Config) (*Service, error) {
 	healthStore := health.NewStore()
 	evaluator := health.NewServiceEvaluator(store, healthStore)
 
+	var producer kafka.Producer
+	if cfg.KafkaEnabled {
+		memProducer := kafka.NewMemoryProducer()
+		producer = kafka.NewLoggingProducer(memProducer, kafka.Config{
+			Enabled:        cfg.KafkaEnabled,
+			Brokers:        cfg.KafkaBrokers,
+			TelemetryTopic: cfg.TelemetryTopic,
+			HealthTopic:    cfg.HealthTopic,
+		})
+		publisher := kafka.NewEventPublisher(producer)
+		evaluator.SetTransitionListener(publisher)
+	}
+
 	stateTracker := polling.NewStateTracker()
 	client := polling.NewClient(cfg.PollTimeout)
 
@@ -48,12 +63,16 @@ func NewService(cfg Config) (*Service, error) {
 
 	engine := polling.NewEngine(registry, store, stateTracker, client, engineConfig)
 	engine.SetHealthEvaluator(evaluator)
+	if producer != nil {
+		engine.SetTelemetryPublisher(kafka.NewEventPublisher(producer))
+	}
 
 	return &Service{
 		registry:     registry,
 		store:        store,
 		healthStore:  healthStore,
 		stateTracker: stateTracker,
+		producer:     producer,
 		engine:       engine,
 	}, nil
 }
@@ -94,6 +113,14 @@ func (s *Service) Run(ctx context.Context) error {
 	// Wait for workers to cleanly exit
 	s.engine.Wait()
 	log.Println("all polling workers stopped cleanly")
+
+	if s.producer != nil {
+		if err := s.producer.Close(); err != nil {
+			log.Printf("[KAFKA] error closing producer: %v", err)
+		} else {
+			log.Println("kafka producer closed cleanly")
+		}
+	}
 
 	return nil
 }

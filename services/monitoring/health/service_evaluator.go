@@ -7,10 +7,16 @@ import (
 	"distributed-network-monitor/services/monitoring/polling"
 )
 
+// TransitionListener receives notifications when a device's health status transitions.
+type TransitionListener interface {
+	OnHealthTransition(deviceID string, prevStatus, currStatus HealthStatus, score int, reasons []string)
+}
+
 // ServiceEvaluator coordinates the evaluation and storage of device health assessments.
 type ServiceEvaluator struct {
-	telemetryStore *polling.Store
-	healthStore    *Store
+	telemetryStore     *polling.Store
+	healthStore        *Store
+	transitionListener TransitionListener
 }
 
 // NewServiceEvaluator constructs a ServiceEvaluator.
@@ -21,6 +27,11 @@ func NewServiceEvaluator(telemetryStore *polling.Store, healthStore *Store) *Ser
 	}
 }
 
+// SetTransitionListener registers a listener for health transitions.
+func (se *ServiceEvaluator) SetTransitionListener(listener TransitionListener) {
+	se.transitionListener = listener
+}
+
 // RecordPollSuccess evaluates and stores the health assessment for a device after a successful poll.
 func (se *ServiceEvaluator) RecordPollSuccess(deviceID string, t polling.Telemetry) {
 	prev, exists := se.healthStore.Get(deviceID)
@@ -29,6 +40,9 @@ func (se *ServiceEvaluator) RecordPollSuccess(deviceID string, t polling.Telemet
 
 	if !exists {
 		log.Printf("[HEALTH] device [%s] initial status: %s (score: %d)", deviceID, assessment.Status, assessment.Score)
+		if se.transitionListener != nil {
+			se.transitionListener.OnHealthTransition(deviceID, "", assessment.Status, assessment.Score, assessment.Reasons)
+		}
 	} else if prev.Status != assessment.Status {
 		reasonStr := ""
 		if len(assessment.Reasons) > 0 {
@@ -36,6 +50,10 @@ func (se *ServiceEvaluator) RecordPollSuccess(deviceID string, t polling.Telemet
 		}
 		log.Printf("[HEALTH] device [%s] transitioned: %s -> %s (score: %d%s)",
 			deviceID, prev.Status, assessment.Status, assessment.Score, reasonStr)
+
+		if se.transitionListener != nil {
+			se.transitionListener.OnHealthTransition(deviceID, prev.Status, assessment.Status, assessment.Score, assessment.Reasons)
+		}
 	}
 }
 
@@ -60,11 +78,20 @@ func (se *ServiceEvaluator) RecordPollFailure(deviceID string, isTransportDown b
 	se.healthStore.Set(deviceID, assessment)
 
 	if !exists || prev.Status != StatusDown {
+		prevStatus := StatusHealthy
+		if exists {
+			prevStatus = prev.Status
+		}
+
 		reasonStr := ""
 		if len(assessment.Reasons) > 0 {
 			reasonStr = " | reasons: " + strings.Join(assessment.Reasons, "; ")
 		}
 		log.Printf("[HEALTH] device [%s] transitioned: %s -> %s (score: %d%s)",
-			deviceID, prev.Status, StatusDown, assessment.Score, reasonStr)
+			deviceID, prevStatus, StatusDown, assessment.Score, reasonStr)
+
+		if se.transitionListener != nil {
+			se.transitionListener.OnHealthTransition(deviceID, prevStatus, StatusDown, assessment.Score, assessment.Reasons)
+		}
 	}
 }

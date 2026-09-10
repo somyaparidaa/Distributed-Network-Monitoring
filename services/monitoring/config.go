@@ -24,6 +24,10 @@ type Config struct {
 	MaxRetries       int
 	RetryBackoff     time.Duration
 	FailureThreshold int
+	KafkaEnabled     bool
+	KafkaBrokers     []string
+	TelemetryTopic   string
+	HealthTopic      string
 }
 
 // DefaultConfig returns the default fleet monitoring configuration targeting router-01, router-02, router-03.
@@ -69,6 +73,28 @@ func DefaultConfig() Config {
 		}
 	}
 
+	kafkaEnabled := true
+	if val := os.Getenv("KAFKA_ENABLED"); val != "" {
+		if b, err := strconv.ParseBool(val); err == nil {
+			kafkaEnabled = b
+		}
+	}
+
+	kafkaBrokers := []string{"localhost:9092"}
+	if val := os.Getenv("KAFKA_BROKERS"); val != "" {
+		kafkaBrokers = strings.Split(val, ",")
+	}
+
+	telemetryTopic := "network.telemetry"
+	if val := os.Getenv("KAFKA_TELEMETRY_TOPIC"); val != "" {
+		telemetryTopic = val
+	}
+
+	healthTopic := "network.health-events"
+	if val := os.Getenv("KAFKA_HEALTH_TOPIC"); val != "" {
+		healthTopic = val
+	}
+
 	return Config{
 		Devices: []DeviceConfig{
 			{
@@ -89,6 +115,10 @@ func DefaultConfig() Config {
 		MaxRetries:       maxRetries,
 		RetryBackoff:     retryBackoff,
 		FailureThreshold: failureThreshold,
+		KafkaEnabled:     kafkaEnabled,
+		KafkaBrokers:     kafkaBrokers,
+		TelemetryTopic:   telemetryTopic,
+		HealthTopic:      healthTopic,
 	}
 }
 
