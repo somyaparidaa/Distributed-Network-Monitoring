@@ -14,6 +14,12 @@ type Poller interface {
 	Poll(ctx context.Context, metricsURL string) (Telemetry, error)
 }
 
+// HealthEvaluator records evaluated health assessments for devices.
+type HealthEvaluator interface {
+	RecordPollSuccess(deviceID string, t Telemetry)
+	RecordPollFailure(deviceID string, isTransportDown bool)
+}
+
 // EngineConfig aggregates tuning parameters for the polling engine.
 type EngineConfig struct {
 	PollInterval     time.Duration
@@ -27,6 +33,7 @@ type Engine struct {
 	store        *Store
 	stateTracker *StateTracker
 	client       Poller
+	healthEval   HealthEvaluator
 	config       EngineConfig
 	wg           sync.WaitGroup
 }
@@ -52,6 +59,11 @@ func NewEngine(
 		client:       client,
 		config:       config,
 	}
+}
+
+// SetHealthEvaluator attaches a health evaluator to the engine.
+func (e *Engine) SetHealthEvaluator(eval HealthEvaluator) {
+	e.healthEval = eval
 }
 
 // Start launches a dedicated polling goroutine for each configured device.
@@ -103,6 +115,10 @@ func (e *Engine) pollOnce(ctx context.Context, dev device.MonitoredDevice) {
 			log.Printf("device [%s] poll failed (%d/%d consecutive): %v",
 				dev.ID, state.ConsecutiveFailures, e.config.FailureThreshold, err)
 		}
+
+		if e.healthEval != nil {
+			e.healthEval.RecordPollFailure(dev.ID, state.Status == StatusDown)
+		}
 		return
 	}
 
@@ -110,5 +126,9 @@ func (e *Engine) pollOnce(ctx context.Context, dev device.MonitoredDevice) {
 	_, recovered := e.stateTracker.RecordSuccess(dev.ID)
 	if recovered {
 		log.Printf("RECOVERY: device [%s] recovered to UP", dev.ID)
+	}
+
+	if e.healthEval != nil {
+		e.healthEval.RecordPollSuccess(dev.ID, telemetry)
 	}
 }

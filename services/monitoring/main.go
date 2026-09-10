@@ -9,6 +9,7 @@ import (
 	"syscall"
 
 	"distributed-network-monitor/services/monitoring/device"
+	"distributed-network-monitor/services/monitoring/health"
 	"distributed-network-monitor/services/monitoring/polling"
 )
 
@@ -16,6 +17,7 @@ import (
 type Service struct {
 	registry     *device.Registry
 	store        *polling.Store
+	healthStore  *health.Store
 	stateTracker *polling.StateTracker
 	engine       *polling.Engine
 }
@@ -29,6 +31,9 @@ func NewService(cfg Config) (*Service, error) {
 	}
 
 	store := polling.NewStore()
+	healthStore := health.NewStore()
+	evaluator := health.NewServiceEvaluator(store, healthStore)
+
 	stateTracker := polling.NewStateTracker()
 	client := polling.NewClient(cfg.PollTimeout)
 
@@ -42,10 +47,12 @@ func NewService(cfg Config) (*Service, error) {
 	}
 
 	engine := polling.NewEngine(registry, store, stateTracker, client, engineConfig)
+	engine.SetHealthEvaluator(evaluator)
 
 	return &Service{
 		registry:     registry,
 		store:        store,
+		healthStore:  healthStore,
 		stateTracker: stateTracker,
 		engine:       engine,
 	}, nil
@@ -59,6 +66,11 @@ func (s *Service) Registry() *device.Registry {
 // Store returns the underlying in-memory telemetry store.
 func (s *Service) Store() *polling.Store {
 	return s.store
+}
+
+// HealthStore returns the underlying in-memory health assessment store.
+func (s *Service) HealthStore() *health.Store {
+	return s.healthStore
 }
 
 // StateTracker returns the underlying device state tracker.

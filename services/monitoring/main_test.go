@@ -121,6 +121,9 @@ func TestNewServiceAndRunLifecycle(t *testing.T) {
 	if service.Registry().Len() != 3 {
 		t.Fatalf("expected 3 devices in service registry, got %d", service.Registry().Len())
 	}
+	if service.HealthStore() == nil {
+		t.Fatal("expected non-nil HealthStore in service")
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 
