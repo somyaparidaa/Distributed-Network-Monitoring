@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"distributed-network-monitor/services/monitoring/device"
 )
@@ -16,7 +17,9 @@ type DeviceConfig struct {
 
 // Config defines top-level configuration for the monitoring service.
 type Config struct {
-	Devices []DeviceConfig
+	Devices      []DeviceConfig
+	PollInterval time.Duration
+	PollTimeout  time.Duration
 }
 
 // DefaultConfig returns the default fleet monitoring configuration targeting router-01, router-02, router-03.
@@ -26,6 +29,20 @@ func DefaultConfig() Config {
 		baseSimulatorURL = "http://localhost:8080"
 	}
 	baseSimulatorURL = strings.TrimRight(baseSimulatorURL, "/")
+
+	pollInterval := 2 * time.Second
+	if val := os.Getenv("POLL_INTERVAL"); val != "" {
+		if d, err := time.ParseDuration(val); err == nil && d > 0 {
+			pollInterval = d
+		}
+	}
+
+	pollTimeout := 1 * time.Second
+	if val := os.Getenv("POLL_TIMEOUT"); val != "" {
+		if d, err := time.ParseDuration(val); err == nil && d > 0 {
+			pollTimeout = d
+		}
+	}
 
 	return Config{
 		Devices: []DeviceConfig{
@@ -42,6 +59,8 @@ func DefaultConfig() Config {
 				MetricsURL: fmt.Sprintf("%s/metrics/router-03", baseSimulatorURL),
 			},
 		},
+		PollInterval: pollInterval,
+		PollTimeout:  pollTimeout,
 	}
 }
 

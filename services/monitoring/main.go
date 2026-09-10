@@ -9,11 +9,14 @@ import (
 	"syscall"
 
 	"distributed-network-monitor/services/monitoring/device"
+	"distributed-network-monitor/services/monitoring/polling"
 )
 
 // Service coordinates monitoring operations and encapsulates application state.
 type Service struct {
 	registry *device.Registry
+	store    *polling.Store
+	engine   *polling.Engine
 }
 
 // NewService constructs a Service instance from the provided Config.
@@ -24,14 +27,25 @@ func NewService(cfg Config) (*Service, error) {
 		return nil, fmt.Errorf("initialize device registry: %w", err)
 	}
 
+	store := polling.NewStore()
+	client := polling.NewClient(cfg.PollTimeout)
+	engine := polling.NewEngine(registry, store, client, cfg.PollInterval)
+
 	return &Service{
 		registry: registry,
+		store:    store,
+		engine:   engine,
 	}, nil
 }
 
 // Registry returns the underlying device registry.
 func (s *Service) Registry() *device.Registry {
 	return s.registry
+}
+
+// Store returns the underlying in-memory telemetry store.
+func (s *Service) Store() *polling.Store {
+	return s.store
 }
 
 // Run executes the monitoring service lifecycle until ctx is cancelled.
@@ -41,8 +55,16 @@ func (s *Service) Run(ctx context.Context) error {
 		log.Printf("  - device [%s] target: %s", d.ID, d.MetricsURL)
 	}
 
+	// Start concurrent polling workers
+	s.engine.Start(ctx)
+
 	<-ctx.Done()
-	log.Println("monitoring service shutdown requested; stopping...")
+	log.Println("monitoring service shutdown requested; waiting for polling workers...")
+
+	// Wait for workers to cleanly exit
+	s.engine.Wait()
+	log.Println("all polling workers stopped cleanly")
+
 	return nil
 }
 
