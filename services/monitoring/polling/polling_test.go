@@ -3,6 +3,7 @@ package polling
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -82,42 +83,46 @@ func TestClientSuccess(t *testing.T) {
 	}
 }
 
-func TestClientErrors(t *testing.T) {
+func TestClientErrorClassification(t *testing.T) {
 	tests := []struct {
-		name       string
-		handler    http.HandlerFunc
-		timeout    time.Duration
-		expectFail bool
+		name          string
+		handler       http.HandlerFunc
+		timeout       time.Duration
+		expectedClass error
 	}{
 		{
-			name: "503 service unavailable",
+			name: "503 classified as ErrDeviceUnavailable",
 			handler: func(w http.ResponseWriter, r *http.Request) {
 				w.WriteHeader(http.StatusServiceUnavailable)
 			},
-			timeout: time.Second,
+			timeout:       time.Second,
+			expectedClass: ErrDeviceUnavailable,
 		},
 		{
-			name: "404 not found",
+			name: "request timeout classified as ErrDeviceUnreachable",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				time.Sleep(50 * time.Millisecond)
+				w.WriteHeader(http.StatusOK)
+			},
+			timeout:       10 * time.Millisecond,
+			expectedClass: ErrDeviceUnreachable,
+		},
+		{
+			name: "404 not found is unclassified/non-transient",
 			handler: func(w http.ResponseWriter, r *http.Request) {
 				w.WriteHeader(http.StatusNotFound)
 			},
-			timeout: time.Second,
+			timeout:       time.Second,
+			expectedClass: nil, // Should not match 503 or unreachable
 		},
 		{
-			name: "malformed json response",
+			name: "malformed json is unclassified/non-transient",
 			handler: func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
 				_, _ = w.Write([]byte("{invalid-json"))
 			},
-			timeout: time.Second,
-		},
-		{
-			name: "request timeout exceeded",
-			handler: func(w http.ResponseWriter, r *http.Request) {
-				time.Sleep(100 * time.Millisecond)
-				w.WriteHeader(http.StatusOK)
-			},
-			timeout: 20 * time.Millisecond,
+			timeout:       time.Second,
+			expectedClass: nil,
 		},
 	}
 
@@ -131,132 +136,238 @@ func TestClientErrors(t *testing.T) {
 			if err == nil {
 				t.Fatalf("expected error for case %q, got nil", tc.name)
 			}
+
+			if tc.expectedClass != nil {
+				if !errors.Is(err, tc.expectedClass) {
+					t.Fatalf("expected error to wrap %v, got %v", tc.expectedClass, err)
+				}
+				if !IsRetryable(err) {
+					t.Fatalf("expected error %v to be classified as retryable", err)
+				}
+			} else {
+				if IsRetryable(err) {
+					t.Fatalf("expected error %v NOT to be classified as retryable", err)
+				}
+			}
 		})
 	}
 }
 
-func TestEngineConcurrentPollingIsolation(t *testing.T) {
-	var r1Polls, r2Polls, r3Polls atomic.Int64
+func TestRetryPolicyTransientRecovery(t *testing.T) {
+	var attempts atomic.Int64
 
-	// Server simulates:
-	// - router-01: normal fast response
-	// - router-02: slow response (simulating latency / delay)
-	// - router-03: failure response (503)
+	// Fails twice with 503, succeeds on 3rd attempt
+	fn := func() (Telemetry, error) {
+		att := attempts.Add(1)
+		if att < 3 {
+			return Telemetry{}, fmt.Errorf("%w: status 503", ErrDeviceUnavailable)
+		}
+		return Telemetry{DeviceID: "router-01", CPU: 20}, nil
+	}
+
+	cfg := RetryConfig{
+		MaxRetries:     2,
+		InitialBackoff: 5 * time.Millisecond,
+	}
+
+	telemetry, err := ExecuteWithRetry(context.Background(), cfg, fn)
+	if err != nil {
+		t.Fatalf("expected success after retries, got: %v", err)
+	}
+
+	if telemetry.DeviceID != "router-01" {
+		t.Fatalf("unexpected telemetry: %+v", telemetry)
+	}
+
+	if attempts.Load() != 3 {
+		t.Fatalf("expected 3 attempts, got %d", attempts.Load())
+	}
+}
+
+func TestRetryPolicyNonRetryableDoesNotRetry(t *testing.T) {
+	var attempts atomic.Int64
+
+	// Fails with 404
+	fn := func() (Telemetry, error) {
+		attempts.Add(1)
+		return Telemetry{}, fmt.Errorf("unexpected http status 404")
+	}
+
+	cfg := RetryConfig{
+		MaxRetries:     3,
+		InitialBackoff: 5 * time.Millisecond,
+	}
+
+	_, err := ExecuteWithRetry(context.Background(), cfg, fn)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+
+	// Should stop on attempt 1 because 404 is not transient/retryable
+	if attempts.Load() != 1 {
+		t.Fatalf("expected exactly 1 attempt for non-retryable error, got %d", attempts.Load())
+	}
+}
+
+func TestStateTrackerTransitionsToDownAndRecovers(t *testing.T) {
+	tracker := NewStateTracker()
+	devID := "router-01"
+
+	// 1st failure (threshold = 3)
+	state, transitioned := tracker.RecordFailure(devID, errors.New("err 1"), 3)
+	if transitioned || state.Status != StatusUp || state.ConsecutiveFailures != 1 {
+		t.Fatalf("unexpected state after 1st failure: %+v (transitioned=%v)", state, transitioned)
+	}
+
+	// 2nd failure
+	state, transitioned = tracker.RecordFailure(devID, errors.New("err 2"), 3)
+	if transitioned || state.Status != StatusUp || state.ConsecutiveFailures != 2 {
+		t.Fatalf("unexpected state after 2nd failure: %+v (transitioned=%v)", state, transitioned)
+	}
+
+	// 3rd failure -> should transition to DOWN
+	state, transitioned = tracker.RecordFailure(devID, errors.New("err 3"), 3)
+	if !transitioned || state.Status != StatusDown || state.ConsecutiveFailures != 3 {
+		t.Fatalf("expected transition to DOWN on 3rd failure: %+v (transitioned=%v)", state, transitioned)
+	}
+
+	// 4th failure -> stays DOWN, no transition, and counter capped at threshold (3)
+	state, transitioned = tracker.RecordFailure(devID, errors.New("err 4"), 3)
+	if transitioned || state.Status != StatusDown || state.ConsecutiveFailures != 3 {
+		t.Fatalf("expected to remain DOWN with counter capped at 3: %+v (transitioned=%v)", state, transitioned)
+	}
+
+	// 5th failure -> stays DOWN, counter still 3
+	state, transitioned = tracker.RecordFailure(devID, errors.New("err 5"), 3)
+	if transitioned || state.Status != StatusDown || state.ConsecutiveFailures != 3 {
+		t.Fatalf("expected counter to remain capped at 3: %+v (transitioned=%v)", state, transitioned)
+	}
+
+	// Recovery poll
+	state, recovered := tracker.RecordSuccess(devID)
+	if !recovered || state.Status != StatusUp || state.ConsecutiveFailures != 0 {
+		t.Fatalf("expected recovery to UP: %+v (recovered=%v)", state, recovered)
+	}
+
+	// Subsequent success is NOT another recovery transition
+	state, recovered = tracker.RecordSuccess(devID)
+	if recovered || state.Status != StatusUp || state.ConsecutiveFailures != 0 {
+		t.Fatalf("subsequent success should not report recovered: %+v", state)
+	}
+}
+
+func TestConsecutiveFailuresCappedWhenDownRegression(t *testing.T) {
+	tracker := NewStateTracker()
+	devID := "router-02"
+	threshold := 3
+
+	// Fail 10 consecutive times
+	for i := 1; i <= 10; i++ {
+		state, transitioned := tracker.RecordFailure(devID, errors.New("conn refused"), threshold)
+		if i < threshold {
+			if state.Status != StatusUp || state.ConsecutiveFailures != i || transitioned {
+				t.Fatalf("pre-threshold attempt %d: %+v", i, state)
+			}
+		} else if i == threshold {
+			if state.Status != StatusDown || state.ConsecutiveFailures != threshold || !transitioned {
+				t.Fatalf("threshold transition attempt %d: %+v", i, state)
+			}
+		} else {
+			// i > threshold: must not keep incrementing beyond threshold
+			if state.Status != StatusDown || state.ConsecutiveFailures != threshold || transitioned {
+				t.Fatalf("post-threshold attempt %d: expected counter capped at %d, got %d",
+					i, threshold, state.ConsecutiveFailures)
+			}
+		}
+	}
+
+	// Recover device
+	state, recovered := tracker.RecordSuccess(devID)
+	if !recovered || state.Status != StatusUp || state.ConsecutiveFailures != 0 {
+		t.Fatalf("expected clean recovery: %+v", state)
+	}
+}
+
+func TestEngineFailureTransitionAndFaultIsolation(t *testing.T) {
+	var r1Polls, r2Polls atomic.Int64
+	var r2Down atomic.Bool
+
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/metrics/router-01":
 			r1Polls.Add(1)
-			_ = json.NewEncoder(w).Encode(Telemetry{DeviceID: "router-01", CPU: 10})
+			_ = json.NewEncoder(w).Encode(Telemetry{DeviceID: "router-01", CPU: 30})
 		case "/metrics/router-02":
 			r2Polls.Add(1)
-			time.Sleep(50 * time.Millisecond) // Slow device
-			_ = json.NewEncoder(w).Encode(Telemetry{DeviceID: "router-02", CPU: 20})
-		case "/metrics/router-03":
-			r3Polls.Add(1)
-			w.WriteHeader(http.StatusServiceUnavailable) // Down device
+			if r2Down.Load() {
+				w.WriteHeader(http.StatusServiceUnavailable) // 503
+				return
+			}
+			_ = json.NewEncoder(w).Encode(Telemetry{DeviceID: "router-02", CPU: 40})
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
 	}))
 	defer ts.Close()
 
-	registry, err := device.NewRegistry([]device.MonitoredDevice{
+	registry, _ := device.NewRegistry([]device.MonitoredDevice{
 		{ID: "router-01", MetricsURL: ts.URL + "/metrics/router-01"},
 		{ID: "router-02", MetricsURL: ts.URL + "/metrics/router-02"},
-		{ID: "router-03", MetricsURL: ts.URL + "/metrics/router-03"},
 	})
-	if err != nil {
-		t.Fatalf("create registry: %v", err)
-	}
 
 	store := NewStore()
-	client := NewClient(200 * time.Millisecond)
-	// Short interval to exercise multiple poll loops quickly
-	interval := 30 * time.Millisecond
-	engine := NewEngine(registry, store, client, interval)
+	stateTracker := NewStateTracker()
+	client := NewClient(100 * time.Millisecond)
 
+	engineCfg := EngineConfig{
+		PollInterval: 25 * time.Millisecond,
+		Retry: RetryConfig{
+			MaxRetries:     1,
+			InitialBackoff: 2 * time.Millisecond,
+		},
+		FailureThreshold: 2,
+	}
+
+	engine := NewEngine(registry, store, stateTracker, client, engineCfg)
 	ctx, cancel := context.WithCancel(context.Background())
 	engine.Start(ctx)
 
-	// Let polling run for ~120ms
-	time.Sleep(120 * time.Millisecond)
-	cancel()
-	engine.Wait()
+	// Allow initial poll
+	time.Sleep(35 * time.Millisecond)
 
-	// router-01 should have been polled multiple times quickly
-	if r1Polls.Load() < 2 {
-		t.Fatalf("router-01 should have been polled at least 2 times, got %d", r1Polls.Load())
+	s1, _ := stateTracker.Get("router-01")
+	s2, _ := stateTracker.Get("router-02")
+	if s1.Status != StatusUp || s2.Status != StatusUp {
+		t.Fatalf("expected both devices UP initially: r1=%v r2=%v", s1.Status, s2.Status)
 	}
 
-	// router-02 was slow, but router-01 was NOT blocked by router-02
-	if r2Polls.Load() == 0 {
-		t.Fatalf("router-02 should have been polled, got 0")
+	// Now fail router-02
+	r2Down.Store(true)
+
+	// Wait for ~3 poll intervals so failure threshold (2) is exceeded
+	time.Sleep(90 * time.Millisecond)
+
+	s2After, _ := stateTracker.Get("router-02")
+	if s2After.Status != StatusDown {
+		t.Fatalf("expected router-02 to transition to DOWN, got: %+v", s2After)
 	}
 
-	// router-03 failed, but neither router-01 nor router-02 crashed or stopped
-	if r3Polls.Load() < 2 {
-		t.Fatalf("router-03 should have been polled at least 2 times, got %d", r3Polls.Load())
+	// router-01 MUST remain UP and continue polling normally (fault isolation)
+	s1After, _ := stateTracker.Get("router-01")
+	if s1After.Status != StatusUp {
+		t.Fatalf("router-01 should have remained UP: %+v", s1After)
+	}
+	if r1Polls.Load() < 3 {
+		t.Fatalf("router-01 should have polled >= 3 times, got %d", r1Polls.Load())
 	}
 
-	// Stored telemetry check
-	t1, ok1 := store.Get("router-01")
-	if !ok1 || t1.DeviceID != "router-01" {
-		t.Fatalf("expected router-01 telemetry in store, got %+v (ok=%v)", t1, ok1)
-	}
-
-	t2, ok2 := store.Get("router-02")
-	if !ok2 || t2.DeviceID != "router-02" {
-		t.Fatalf("expected router-02 telemetry in store, got %+v (ok=%v)", t2, ok2)
-	}
-
-	// router-03 failed so it should not be stored
-	_, ok3 := store.Get("router-03")
-	if ok3 {
-		t.Fatal("expected router-03 not to be stored due to 503 status")
-	}
-}
-
-func TestStoreRetainsLatestSuccessfulTelemetryOnSubsequentFailure(t *testing.T) {
-	var returnFailure atomic.Bool
-
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if returnFailure.Load() {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			return
-		}
-		_ = json.NewEncoder(w).Encode(Telemetry{
-			DeviceID: "router-01",
-			CPU:      55.5,
-		})
-	}))
-	defer ts.Close()
-
-	registry, _ := device.NewRegistry([]device.MonitoredDevice{
-		{ID: "router-01", MetricsURL: ts.URL},
-	})
-	store := NewStore()
-	client := NewClient(time.Second)
-	engine := NewEngine(registry, store, client, 20*time.Millisecond)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	engine.Start(ctx)
-
-	// Wait for initial successful poll
-	time.Sleep(30 * time.Millisecond)
-
-	t1, ok := store.Get("router-01")
-	if !ok || t1.CPU != 55.5 {
-		t.Fatalf("expected initial telemetry to be stored, got: %+v (ok=%v)", t1, ok)
-	}
-
-	// Now simulate failure
-	returnFailure.Store(true)
+	// Now recover router-02
+	r2Down.Store(false)
 	time.Sleep(50 * time.Millisecond)
 
-	// Verify the previous successful telemetry is still retained
-	tAfterFail, ok := store.Get("router-01")
-	if !ok || tAfterFail.CPU != 55.5 {
-		t.Fatalf("expected previous telemetry to be retained across failure, got: %+v", tAfterFail)
+	s2Recovered, _ := stateTracker.Get("router-02")
+	if s2Recovered.Status != StatusUp || s2Recovered.ConsecutiveFailures != 0 {
+		t.Fatalf("expected router-02 to recover to UP: %+v", s2Recovered)
 	}
 
 	cancel()

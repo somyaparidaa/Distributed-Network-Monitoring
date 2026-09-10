@@ -14,25 +14,43 @@ type Poller interface {
 	Poll(ctx context.Context, metricsURL string) (Telemetry, error)
 }
 
-// Engine coordinates concurrent background polling for all devices in the registry.
-type Engine struct {
-	registry *device.Registry
-	store    *Store
-	client   Poller
-	interval time.Duration
-	wg       sync.WaitGroup
+// EngineConfig aggregates tuning parameters for the polling engine.
+type EngineConfig struct {
+	PollInterval     time.Duration
+	Retry            RetryConfig
+	FailureThreshold int
 }
 
-// NewEngine constructs a new concurrent Polling Engine.
-func NewEngine(registry *device.Registry, store *Store, client Poller, interval time.Duration) *Engine {
-	if interval <= 0 {
-		interval = 2 * time.Second
+// Engine coordinates concurrent background polling for all devices in the registry.
+type Engine struct {
+	registry     *device.Registry
+	store        *Store
+	stateTracker *StateTracker
+	client       Poller
+	config       EngineConfig
+	wg           sync.WaitGroup
+}
+
+// NewEngine constructs a new concurrent Polling Engine with retries and state tracking.
+func NewEngine(
+	registry *device.Registry,
+	store *Store,
+	stateTracker *StateTracker,
+	client Poller,
+	config EngineConfig,
+) *Engine {
+	if config.PollInterval <= 0 {
+		config.PollInterval = 2 * time.Second
+	}
+	if config.FailureThreshold <= 0 {
+		config.FailureThreshold = 3
 	}
 	return &Engine{
-		registry: registry,
-		store:    store,
-		client:   client,
-		interval: interval,
+		registry:     registry,
+		store:        store,
+		stateTracker: stateTracker,
+		client:       client,
+		config:       config,
 	}
 }
 
@@ -56,7 +74,7 @@ func (e *Engine) pollWorker(ctx context.Context, dev device.MonitoredDevice) {
 	// Perform an initial poll immediately upon startup
 	e.pollOnce(ctx, dev)
 
-	ticker := time.NewTicker(e.interval)
+	ticker := time.NewTicker(e.config.PollInterval)
 	defer ticker.Stop()
 
 	for {
@@ -70,11 +88,27 @@ func (e *Engine) pollWorker(ctx context.Context, dev device.MonitoredDevice) {
 }
 
 func (e *Engine) pollOnce(ctx context.Context, dev device.MonitoredDevice) {
-	telemetry, err := e.client.Poll(ctx, dev.MetricsURL)
+	telemetry, err := ExecuteWithRetry(ctx, e.config.Retry, func() (Telemetry, error) {
+		return e.client.Poll(ctx, dev.MetricsURL)
+	})
+
 	if err != nil {
-		log.Printf("device [%s] poll failed: %v", dev.ID, err)
+		state, transitioned := e.stateTracker.RecordFailure(dev.ID, err, e.config.FailureThreshold)
+		if transitioned {
+			log.Printf("ALERT: device [%s] transitioned to DOWN after %d consecutive failures (last error: %v)",
+				dev.ID, state.ConsecutiveFailures, err)
+		} else if state.Status == StatusDown {
+			log.Printf("device [%s] poll failed (device is DOWN): %v", dev.ID, err)
+		} else {
+			log.Printf("device [%s] poll failed (%d/%d consecutive): %v",
+				dev.ID, state.ConsecutiveFailures, e.config.FailureThreshold, err)
+		}
 		return
 	}
 
 	e.store.Set(dev.ID, telemetry)
+	_, recovered := e.stateTracker.RecordSuccess(dev.ID)
+	if recovered {
+		log.Printf("RECOVERY: device [%s] recovered to UP", dev.ID)
+	}
 }

@@ -3,10 +3,19 @@ package polling
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"time"
+)
+
+var (
+	// ErrDeviceUnavailable indicates a 503 response from a DOWN device.
+	ErrDeviceUnavailable = errors.New("device unavailable")
+	// ErrDeviceUnreachable indicates transport, connection, or timeout failure.
+	ErrDeviceUnreachable = errors.New("device unreachable")
 )
 
 // HTTPClient defines the interface for making HTTP requests.
@@ -56,9 +65,18 @@ func (c *Client) Poll(ctx context.Context, metricsURL string) (Telemetry, error)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return Telemetry{}, fmt.Errorf("http request failed: %w", err)
+		// Classify connection/timeout errors as unreachable
+		var netErr net.Error
+		if errors.As(err, &netErr) || errors.Is(err, context.DeadlineExceeded) || errors.Is(reqCtx.Err(), context.DeadlineExceeded) {
+			return Telemetry{}, fmt.Errorf("%w: %v", ErrDeviceUnreachable, err)
+		}
+		return Telemetry{}, fmt.Errorf("%w: %v", ErrDeviceUnreachable, err)
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusServiceUnavailable {
+		return Telemetry{}, fmt.Errorf("%w: http status 503", ErrDeviceUnavailable)
+	}
 
 	if resp.StatusCode != http.StatusOK {
 		return Telemetry{}, fmt.Errorf("unexpected http status %d", resp.StatusCode)

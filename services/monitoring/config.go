@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -17,9 +18,12 @@ type DeviceConfig struct {
 
 // Config defines top-level configuration for the monitoring service.
 type Config struct {
-	Devices      []DeviceConfig
-	PollInterval time.Duration
-	PollTimeout  time.Duration
+	Devices          []DeviceConfig
+	PollInterval     time.Duration
+	PollTimeout      time.Duration
+	MaxRetries       int
+	RetryBackoff     time.Duration
+	FailureThreshold int
 }
 
 // DefaultConfig returns the default fleet monitoring configuration targeting router-01, router-02, router-03.
@@ -44,6 +48,27 @@ func DefaultConfig() Config {
 		}
 	}
 
+	maxRetries := 2
+	if val := os.Getenv("MAX_RETRIES"); val != "" {
+		if n, err := strconv.Atoi(val); err == nil && n >= 0 {
+			maxRetries = n
+		}
+	}
+
+	retryBackoff := 50 * time.Millisecond
+	if val := os.Getenv("RETRY_BACKOFF"); val != "" {
+		if d, err := time.ParseDuration(val); err == nil && d > 0 {
+			retryBackoff = d
+		}
+	}
+
+	failureThreshold := 3
+	if val := os.Getenv("FAILURE_THRESHOLD"); val != "" {
+		if n, err := strconv.Atoi(val); err == nil && n > 0 {
+			failureThreshold = n
+		}
+	}
+
 	return Config{
 		Devices: []DeviceConfig{
 			{
@@ -59,8 +84,11 @@ func DefaultConfig() Config {
 				MetricsURL: fmt.Sprintf("%s/metrics/router-03", baseSimulatorURL),
 			},
 		},
-		PollInterval: pollInterval,
-		PollTimeout:  pollTimeout,
+		PollInterval:     pollInterval,
+		PollTimeout:      pollTimeout,
+		MaxRetries:       maxRetries,
+		RetryBackoff:     retryBackoff,
+		FailureThreshold: failureThreshold,
 	}
 }
 

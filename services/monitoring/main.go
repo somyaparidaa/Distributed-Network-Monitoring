@@ -14,9 +14,10 @@ import (
 
 // Service coordinates monitoring operations and encapsulates application state.
 type Service struct {
-	registry *device.Registry
-	store    *polling.Store
-	engine   *polling.Engine
+	registry     *device.Registry
+	store        *polling.Store
+	stateTracker *polling.StateTracker
+	engine       *polling.Engine
 }
 
 // NewService constructs a Service instance from the provided Config.
@@ -28,13 +29,25 @@ func NewService(cfg Config) (*Service, error) {
 	}
 
 	store := polling.NewStore()
+	stateTracker := polling.NewStateTracker()
 	client := polling.NewClient(cfg.PollTimeout)
-	engine := polling.NewEngine(registry, store, client, cfg.PollInterval)
+
+	engineConfig := polling.EngineConfig{
+		PollInterval: cfg.PollInterval,
+		Retry: polling.RetryConfig{
+			MaxRetries:     cfg.MaxRetries,
+			InitialBackoff: cfg.RetryBackoff,
+		},
+		FailureThreshold: cfg.FailureThreshold,
+	}
+
+	engine := polling.NewEngine(registry, store, stateTracker, client, engineConfig)
 
 	return &Service{
-		registry: registry,
-		store:    store,
-		engine:   engine,
+		registry:     registry,
+		store:        store,
+		stateTracker: stateTracker,
+		engine:       engine,
 	}, nil
 }
 
@@ -46,6 +59,11 @@ func (s *Service) Registry() *device.Registry {
 // Store returns the underlying in-memory telemetry store.
 func (s *Service) Store() *polling.Store {
 	return s.store
+}
+
+// StateTracker returns the underlying device state tracker.
+func (s *Service) StateTracker() *polling.StateTracker {
+	return s.stateTracker
 }
 
 // Run executes the monitoring service lifecycle until ctx is cancelled.
