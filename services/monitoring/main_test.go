@@ -113,6 +113,7 @@ func TestRegistryValidationErrors(t *testing.T) {
 
 func TestNewServiceAndRunLifecycle(t *testing.T) {
 	cfg := DefaultConfig()
+	cfg.HTTPAddr = "127.0.0.1:0" // Ephemeral port for test
 	service, err := NewService(cfg)
 	if err != nil {
 		t.Fatalf("failed to create service: %v", err)

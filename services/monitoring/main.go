@@ -4,10 +4,13 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
+	"distributed-network-monitor/services/monitoring/api"
 	"distributed-network-monitor/services/monitoring/device"
 	"distributed-network-monitor/services/monitoring/health"
 	"distributed-network-monitor/services/monitoring/kafka"
@@ -22,6 +25,8 @@ type Service struct {
 	stateTracker *polling.StateTracker
 	producer     kafka.Producer
 	engine       *polling.Engine
+	apiHandler   *api.Handler
+	httpAddr     string
 }
 
 // NewService constructs a Service instance from the provided Config.
@@ -67,6 +72,8 @@ func NewService(cfg Config) (*Service, error) {
 		engine.SetTelemetryPublisher(kafka.NewEventPublisher(producer))
 	}
 
+	apiHandler := api.NewHandler(registry, store, healthStore, stateTracker)
+
 	return &Service{
 		registry:     registry,
 		store:        store,
@@ -74,6 +81,8 @@ func NewService(cfg Config) (*Service, error) {
 		stateTracker: stateTracker,
 		producer:     producer,
 		engine:       engine,
+		apiHandler:   apiHandler,
+		httpAddr:     cfg.HTTPAddr,
 	}, nil
 }
 
@@ -97,23 +106,74 @@ func (s *Service) StateTracker() *polling.StateTracker {
 	return s.stateTracker
 }
 
+// APIHandler returns the underlying HTTP API handler.
+func (s *Service) APIHandler() *api.Handler {
+	return s.apiHandler
+}
+
 // Run executes the monitoring service lifecycle until ctx is cancelled.
+//
+// Graceful shutdown order:
+// 1. Stop accepting HTTP requests & gracefully shut down HTTP server
+// 2. Stop polling workers
+// 3. Close Kafka producer
 func (s *Service) Run(ctx context.Context) error {
 	log.Printf("monitoring service started; managing %d configured devices:", s.registry.Len())
 	for _, d := range s.registry.List() {
 		log.Printf("  - device [%s] target: %s", d.ID, d.MetricsURL)
 	}
 
+	// Create child context for polling workers
+	pollCtx, cancelPoll := context.WithCancel(context.Background())
+	defer cancelPoll()
+
 	// Start concurrent polling workers
-	s.engine.Start(ctx)
+	s.engine.Start(pollCtx)
 
-	<-ctx.Done()
-	log.Println("monitoring service shutdown requested; waiting for polling workers...")
+	// Start HTTP API server
+	server := &http.Server{
+		Addr:    s.httpAddr,
+		Handler: s.apiHandler.Routes(),
+	}
 
-	// Wait for workers to cleanly exit
+	serverErr := make(chan error, 1)
+	go func() {
+		log.Printf("monitoring state API listening on %s", s.httpAddr)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			serverErr <- err
+		}
+		close(serverErr)
+	}()
+
+	select {
+	case err := <-serverErr:
+		cancelPoll()
+		s.engine.Wait()
+		if s.producer != nil {
+			_ = s.producer.Close()
+		}
+		return fmt.Errorf("monitoring api server error: %w", err)
+	case <-ctx.Done():
+		log.Println("monitoring service shutdown requested...")
+	}
+
+	// 1. Stop accepting HTTP requests & gracefully shut down HTTP server
+	shutdownCtx, cancelHTTP := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancelHTTP()
+
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		log.Printf("monitoring api server shutdown error: %v", err)
+	} else {
+		log.Println("monitoring api server stopped gracefully")
+	}
+	<-serverErr
+
+	// 2. Stop polling workers
+	cancelPoll()
 	s.engine.Wait()
 	log.Println("all polling workers stopped cleanly")
 
+	// 3. Close Kafka producer
 	if s.producer != nil {
 		if err := s.producer.Close(); err != nil {
 			log.Printf("[KAFKA] error closing producer: %v", err)

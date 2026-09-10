@@ -28,6 +28,7 @@ type Config struct {
 	KafkaBrokers     []string
 	TelemetryTopic   string
 	HealthTopic      string
+	HTTPAddr         string
 }
 
 // DefaultConfig returns the default fleet monitoring configuration targeting router-01, router-02, router-03.
@@ -95,6 +96,13 @@ func DefaultConfig() Config {
 		healthTopic = val
 	}
 
+	httpAddr := ":8081"
+	if val := os.Getenv("MONITORING_HTTP_ADDR"); val != "" {
+		httpAddr = val
+	} else if val := os.Getenv("HTTP_ADDR"); val != "" {
+		httpAddr = val
+	}
+
 	return Config{
 		Devices: []DeviceConfig{
 			{
@@ -119,6 +127,7 @@ func DefaultConfig() Config {
 		KafkaBrokers:     kafkaBrokers,
 		TelemetryTopic:   telemetryTopic,
 		HealthTopic:      healthTopic,
+		HTTPAddr:         httpAddr,
 	}
 }
 
