@@ -12,6 +12,7 @@ import (
 
 	"distributed-network-monitor/services/monitoring/device"
 	"distributed-network-monitor/services/monitoring/health"
+	"distributed-network-monitor/services/monitoring/kafka"
 	"distributed-network-monitor/services/monitoring/polling"
 )
 
@@ -366,5 +367,31 @@ func TestEndToEndIntegratedMonitoringPipeline(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("service.Run did not stop within deadline")
+	}
+}
+
+func TestNewServiceCreatesRealKafkaProducerWhenEnabled(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.KafkaEnabled = true
+	cfg.KafkaBrokers = []string{"localhost:9092"}
+
+	service, err := NewService(cfg)
+	if err != nil {
+		t.Fatalf("failed to create service: %v", err)
+	}
+
+	if service.Producer() == nil {
+		t.Fatal("expected non-nil producer when KafkaEnabled=true")
+	}
+
+	// In production, NewService creates a LoggingProducer wrapping a KafkaProducer
+	lp, ok := service.Producer().(*kafka.LoggingProducer)
+	if !ok {
+		t.Fatalf("expected producer to be *kafka.LoggingProducer, got %T", service.Producer())
+	}
+
+	_, isLiveKafka := lp.Underlying().(*kafka.KafkaProducer)
+	if !isLiveKafka {
+		t.Fatalf("expected underlying producer to be *kafka.KafkaProducer, got %T", lp.Underlying())
 	}
 }

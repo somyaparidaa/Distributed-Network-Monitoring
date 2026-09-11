@@ -155,3 +155,8 @@ func (lp *LoggingProducer) Close() error {
 	}
 	return nil
 }
+
+// Underlying returns the wrapped Producer instance.
+func (lp *LoggingProducer) Underlying() Producer {
+	return lp.underlying
+}

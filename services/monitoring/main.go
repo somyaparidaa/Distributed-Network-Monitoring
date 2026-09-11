@@ -30,7 +30,15 @@ type Service struct {
 }
 
 // NewService constructs a Service instance from the provided Config.
+// When KAFKA_ENABLED=true, it initializes a production KafkaProducer connecting to the configured brokers.
+// When KAFKA_ENABLED=false, no producer is created.
 func NewService(cfg Config) (*Service, error) {
+	return NewServiceWithProducer(cfg, nil)
+}
+
+// NewServiceWithProducer allows injecting a specific Producer (e.g. MemoryProducer for tests).
+// If injectedProducer is nil and KafkaEnabled is true, a live KafkaProducer is created.
+func NewServiceWithProducer(cfg Config, injectedProducer kafka.Producer) (*Service, error) {
 	devices := cfg.ToMonitoredDevices()
 	registry, err := device.NewRegistry(devices)
 	if err != nil {
@@ -43,13 +51,21 @@ func NewService(cfg Config) (*Service, error) {
 
 	var producer kafka.Producer
 	if cfg.KafkaEnabled {
-		memProducer := kafka.NewMemoryProducer()
-		producer = kafka.NewLoggingProducer(memProducer, kafka.Config{
-			Enabled:        cfg.KafkaEnabled,
-			Brokers:        cfg.KafkaBrokers,
-			TelemetryTopic: cfg.TelemetryTopic,
-			HealthTopic:    cfg.HealthTopic,
-		})
+		if injectedProducer != nil {
+			producer = injectedProducer
+		} else {
+			kafkaCfg := kafka.Config{
+				Enabled:        cfg.KafkaEnabled,
+				Brokers:        cfg.KafkaBrokers,
+				TelemetryTopic: cfg.TelemetryTopic,
+				HealthTopic:    cfg.HealthTopic,
+			}
+			liveProducer, err := kafka.NewKafkaProducer(kafkaCfg, nil)
+			if err != nil {
+				return nil, fmt.Errorf("initialize kafka producer: %w", err)
+			}
+			producer = kafka.NewLoggingProducer(liveProducer, kafkaCfg)
+		}
 		publisher := kafka.NewEventPublisher(producer)
 		evaluator.SetTransitionListener(publisher)
 	}
@@ -84,6 +100,11 @@ func NewService(cfg Config) (*Service, error) {
 		apiHandler:   apiHandler,
 		httpAddr:     cfg.HTTPAddr,
 	}, nil
+}
+
+// Producer returns the underlying Kafka Producer instance.
+func (s *Service) Producer() kafka.Producer {
+	return s.producer
 }
 
 // Registry returns the underlying device registry.
