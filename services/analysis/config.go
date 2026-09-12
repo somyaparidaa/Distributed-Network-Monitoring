@@ -13,6 +13,12 @@ type Config struct {
 	ConsumerGroup  string
 	TelemetryTopic string
 	HealthTopic    string
+
+	RedisEnabled   bool
+	RedisAddr      string
+	RedisDB        int
+	RedisPassword  string
+	RedisKeyPrefix string
 }
 
 // DefaultConfig returns the default configuration for the Analysis Service.
@@ -54,11 +60,42 @@ func DefaultConfig() Config {
 		healthTopic = strings.TrimSpace(val)
 	}
 
+	redisEnabled := true
+	if val := os.Getenv("REDIS_ENABLED"); val != "" {
+		if b, err := strconv.ParseBool(val); err == nil {
+			redisEnabled = b
+		}
+	}
+
+	redisAddr := "localhost:6379"
+	if val := os.Getenv("REDIS_ADDR"); strings.TrimSpace(val) != "" {
+		redisAddr = strings.TrimSpace(val)
+	}
+
+	redisDB := 0
+	if val := os.Getenv("REDIS_DB"); strings.TrimSpace(val) != "" {
+		if n, err := strconv.Atoi(strings.TrimSpace(val)); err == nil && n >= 0 {
+			redisDB = n
+		}
+	}
+
+	redisPassword := os.Getenv("REDIS_PASSWORD")
+
+	redisKeyPrefix := "analysis"
+	if val := os.Getenv("REDIS_KEY_PREFIX"); strings.TrimSpace(val) != "" {
+		redisKeyPrefix = strings.TrimSpace(val)
+	}
+
 	return Config{
 		KafkaEnabled:   kafkaEnabled,
 		KafkaBrokers:   kafkaBrokers,
 		ConsumerGroup:  consumerGroup,
 		TelemetryTopic: telemetryTopic,
 		HealthTopic:    healthTopic,
+		RedisEnabled:   redisEnabled,
+		RedisAddr:      redisAddr,
+		RedisDB:        redisDB,
+		RedisPassword:  redisPassword,
+		RedisKeyPrefix: redisKeyPrefix,
 	}
 }
