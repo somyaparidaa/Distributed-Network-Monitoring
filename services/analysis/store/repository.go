@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 
 	"distributed-network-monitor/services/analysis/model"
@@ -11,13 +12,17 @@ import (
 // ErrNotFound indicates that the requested device state key was not found in storage.
 var ErrNotFound = errors.New("device state not found")
 
-// DeviceStateRepository defines the contract for persisting and retrieving latest device state.
+// DeviceStateRepository defines the contract for persisting and retrieving latest device state and rolling metrics.
 type DeviceStateRepository interface {
 	SaveLatestTelemetry(ctx context.Context, deviceID string, event model.TelemetryEvent) error
 	SaveLatestHealth(ctx context.Context, deviceID string, event model.HealthEvent) error
 	GetLatestTelemetry(ctx context.Context, deviceID string) (*model.TelemetryEvent, error)
 	GetLatestHealth(ctx context.Context, deviceID string) (*model.HealthEvent, error)
 	ListDevices(ctx context.Context) ([]string, error)
+
+	SaveRollingMetrics(ctx context.Context, metrics model.RollingMetrics) error
+	GetRollingMetrics(ctx context.Context, deviceID string, window string) (*model.RollingMetrics, error)
+
 	Close() error
 }
 
@@ -27,6 +32,7 @@ type MemoryRepository struct {
 	devices   map[string]struct{}
 	telemetry map[string]model.TelemetryEvent
 	health    map[string]model.HealthEvent
+	metrics   map[string]model.RollingMetrics // key: deviceID + ":" + window
 	closed    bool
 }
 
@@ -36,6 +42,7 @@ func NewMemoryRepository() *MemoryRepository {
 		devices:   make(map[string]struct{}),
 		telemetry: make(map[string]model.TelemetryEvent),
 		health:    make(map[string]model.HealthEvent),
+		metrics:   make(map[string]model.RollingMetrics),
 	}
 }
 
@@ -109,6 +116,44 @@ func (m *MemoryRepository) GetLatestHealth(ctx context.Context, deviceID string)
 		return nil, ErrNotFound
 	}
 	return &event, nil
+}
+
+// SaveRollingMetrics stores the latest rolling metrics snapshot for a device and window.
+func (m *MemoryRepository) SaveRollingMetrics(ctx context.Context, metrics model.RollingMetrics) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.closed {
+		return errors.New("repository is closed")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	m.devices[metrics.DeviceID] = struct{}{}
+	key := fmt.Sprintf("%s:%s", metrics.DeviceID, metrics.Window)
+	m.metrics[key] = metrics
+	return nil
+}
+
+// GetRollingMetrics retrieves the latest rolling metrics for a device and window.
+func (m *MemoryRepository) GetRollingMetrics(ctx context.Context, deviceID string, window string) (*model.RollingMetrics, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if m.closed {
+		return nil, errors.New("repository is closed")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	key := fmt.Sprintf("%s:%s", deviceID, window)
+	metrics, exists := m.metrics[key]
+	if !exists {
+		return nil, ErrNotFound
+	}
+	return &metrics, nil
 }
 
 // ListDevices returns all known device IDs.

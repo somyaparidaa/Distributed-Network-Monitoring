@@ -4,6 +4,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Config defines top-level configuration for the analysis service.
@@ -19,6 +20,8 @@ type Config struct {
 	RedisDB        int
 	RedisPassword  string
 	RedisKeyPrefix string
+
+	AggregationWindows map[string]time.Duration
 }
 
 // DefaultConfig returns the default configuration for the Analysis Service.
@@ -86,16 +89,44 @@ func DefaultConfig() Config {
 		redisKeyPrefix = strings.TrimSpace(val)
 	}
 
-	return Config{
-		KafkaEnabled:   kafkaEnabled,
-		KafkaBrokers:   kafkaBrokers,
-		ConsumerGroup:  consumerGroup,
-		TelemetryTopic: telemetryTopic,
-		HealthTopic:    healthTopic,
-		RedisEnabled:   redisEnabled,
-		RedisAddr:      redisAddr,
-		RedisDB:        redisDB,
-		RedisPassword:  redisPassword,
-		RedisKeyPrefix: redisKeyPrefix,
+	aggregationWindows := map[string]time.Duration{
+		"1m": 1 * time.Minute,
+		"5m": 5 * time.Minute,
 	}
+	if val := os.Getenv("AGGREGATION_WINDOWS"); strings.TrimSpace(val) != "" {
+		parsed := parseAggregationWindows(val)
+		if len(parsed) > 0 {
+			aggregationWindows = parsed
+		}
+	}
+
+	return Config{
+		KafkaEnabled:       kafkaEnabled,
+		KafkaBrokers:       kafkaBrokers,
+		ConsumerGroup:      consumerGroup,
+		TelemetryTopic:     telemetryTopic,
+		HealthTopic:        healthTopic,
+		RedisEnabled:       redisEnabled,
+		RedisAddr:          redisAddr,
+		RedisDB:            redisDB,
+		RedisPassword:      redisPassword,
+		RedisKeyPrefix:     redisKeyPrefix,
+		AggregationWindows: aggregationWindows,
+	}
+}
+
+func parseAggregationWindows(s string) map[string]time.Duration {
+	parts := strings.Split(s, ",")
+	res := make(map[string]time.Duration)
+	for _, p := range parts {
+		name := strings.TrimSpace(p)
+		if name == "" {
+			continue
+		}
+		dur, err := time.ParseDuration(name)
+		if err == nil && dur > 0 {
+			res[name] = dur
+		}
+	}
+	return res
 }

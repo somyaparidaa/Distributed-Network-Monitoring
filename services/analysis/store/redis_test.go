@@ -172,3 +172,113 @@ func TestLiveRedisWhenAvailable(t *testing.T) {
 		t.Fatalf("expected 'router-live-01' in devices set %v", devices)
 	}
 }
+
+func TestMemoryRepositoryRollingMetrics(t *testing.T) {
+	repo := NewMemoryRepository()
+	defer repo.Close()
+
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	// Missing metrics returns ErrNotFound
+	_, err := repo.GetRollingMetrics(ctx, "router-01", "1m")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound for missing metrics, got: %v", err)
+	}
+
+	metrics := model.RollingMetrics{
+		DeviceID:         "router-01",
+		Window:           "1m",
+		SampleCount:      10,
+		AvgLatencyMS:     25.5,
+		MinLatencyMS:     15,
+		MaxLatencyMS:     40,
+		AvgPacketLoss:    0.2,
+		MaxPacketLoss:    1.0,
+		AvgCPU:           50.0,
+		MaxCPU:           75.0,
+		AvgMemory:        60.0,
+		MaxMemory:        70.0,
+		FirstSampleTime:  now.Add(-1 * time.Minute),
+		LatestSampleTime: now,
+		CalculatedAt:     now,
+	}
+
+	if err := repo.SaveRollingMetrics(ctx, metrics); err != nil {
+		t.Fatalf("failed to save rolling metrics: %v", err)
+	}
+
+	fetched, err := repo.GetRollingMetrics(ctx, "router-01", "1m")
+	if err != nil {
+		t.Fatalf("failed to get rolling metrics: %v", err)
+	}
+	if fetched.SampleCount != 10 || fetched.AvgCPU != 50.0 || fetched.MaxLatencyMS != 40 {
+		t.Fatalf("metrics mismatch: %+v", fetched)
+	}
+
+	// Device set should include router-01
+	devices, err := repo.ListDevices(ctx)
+	if err != nil || len(devices) != 1 || devices[0] != "router-01" {
+		t.Fatalf("expected devices ['router-01'], got %v", devices)
+	}
+}
+
+func TestLiveRedisRollingMetrics(t *testing.T) {
+	conn, err := net.DialTimeout("tcp", "localhost:6379", 200*time.Millisecond)
+	if err != nil {
+		t.Skip("Redis not available on localhost:6379, skipping live Redis integration test")
+	}
+	_ = conn.Close()
+
+	cfg := RedisConfig{
+		Addr:      "localhost:6379",
+		DB:        15,
+		KeyPrefix: "test_analysis_metrics",
+	}
+
+	repo, err := NewRedisRepository(cfg)
+	if err != nil {
+		t.Fatalf("failed to initialize live RedisRepository: %v", err)
+	}
+	defer repo.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// Missing metrics returns ErrNotFound
+	_, err = repo.GetRollingMetrics(ctx, "nonexistent", "1m")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound for missing metrics in live Redis, got: %v", err)
+	}
+
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	metrics := model.RollingMetrics{
+		DeviceID:         "router-metrics-01",
+		Window:           "1m",
+		SampleCount:      5,
+		AvgLatencyMS:     32.1,
+		MinLatencyMS:     20,
+		MaxLatencyMS:     50,
+		AvgPacketLoss:    0.1,
+		MaxPacketLoss:    0.5,
+		AvgCPU:           42.0,
+		MaxCPU:           55.0,
+		AvgMemory:        58.0,
+		MaxMemory:        65.0,
+		FirstSampleTime:  now.Add(-40 * time.Second),
+		LatestSampleTime: now,
+		CalculatedAt:     now,
+	}
+
+	if err := repo.SaveRollingMetrics(ctx, metrics); err != nil {
+		t.Fatalf("failed to save rolling metrics to live Redis: %v", err)
+	}
+
+	fetched, err := repo.GetRollingMetrics(ctx, "router-metrics-01", "1m")
+	if err != nil {
+		t.Fatalf("failed to get rolling metrics from live Redis: %v", err)
+	}
+	if fetched.SampleCount != 5 || fetched.AvgLatencyMS != 32.1 || fetched.MaxCPU != 55.0 {
+		t.Fatalf("fetched metrics mismatch: %+v", fetched)
+	}
+}

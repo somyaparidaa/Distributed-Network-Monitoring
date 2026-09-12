@@ -155,3 +155,41 @@ func (r *RedisRepository) ListDevices(ctx context.Context) ([]string, error) {
 func (r *RedisRepository) Close() error {
 	return r.client.Close()
 }
+
+func (r *RedisRepository) aggregateKey(deviceID, window string) string {
+	return fmt.Sprintf("%s:device:%s:aggregate:%s", r.prefix, deviceID, window)
+}
+
+// SaveRollingMetrics serializes RollingMetrics to JSON and stores it under analysis:device:{id}:aggregate:{window} with NO TTL.
+func (r *RedisRepository) SaveRollingMetrics(ctx context.Context, metrics model.RollingMetrics) error {
+	data, err := json.Marshal(metrics)
+	if err != nil {
+		return fmt.Errorf("marshal rolling metrics: %w", err)
+	}
+
+	pipe := r.client.Pipeline()
+	pipe.Set(ctx, r.aggregateKey(metrics.DeviceID, metrics.Window), data, 0)
+	pipe.SAdd(ctx, r.devicesKey(), metrics.DeviceID)
+
+	if _, err := pipe.Exec(ctx); err != nil {
+		return fmt.Errorf("save rolling metrics in redis: %w", err)
+	}
+	return nil
+}
+
+// GetRollingMetrics retrieves and deserializes the latest rolling metrics for a device and window.
+func (r *RedisRepository) GetRollingMetrics(ctx context.Context, deviceID string, window string) (*model.RollingMetrics, error) {
+	val, err := r.client.Get(ctx, r.aggregateKey(deviceID, window)).Bytes()
+	if err != nil {
+		if errors.Is(err, redis.Nil) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("get rolling metrics from redis: %w", err)
+	}
+
+	var metrics model.RollingMetrics
+	if err := json.Unmarshal(val, &metrics); err != nil {
+		return nil, fmt.Errorf("unmarshal rolling metrics from redis: %w", err)
+	}
+	return &metrics, nil
+}

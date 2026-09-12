@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"distributed-network-monitor/services/analysis/aggregation"
 	"distributed-network-monitor/services/analysis/consumer"
 	"distributed-network-monitor/services/analysis/model"
 	"distributed-network-monitor/services/analysis/store"
@@ -63,6 +64,9 @@ func TestConfigDefaultsAndOverrides(t *testing.T) {
 	if cfg.RedisKeyPrefix != "analysis" {
 		t.Fatalf("expected RedisKeyPrefix default 'analysis', got %q", cfg.RedisKeyPrefix)
 	}
+	if len(cfg.AggregationWindows) != 2 || cfg.AggregationWindows["1m"] != 1*time.Minute || cfg.AggregationWindows["5m"] != 5*time.Minute {
+		t.Fatalf("expected AggregationWindows [1m, 5m], got %v", cfg.AggregationWindows)
+	}
 
 	// 2. Test overrides
 	t.Setenv("KAFKA_ENABLED", "false")
@@ -75,6 +79,7 @@ func TestConfigDefaultsAndOverrides(t *testing.T) {
 	t.Setenv("REDIS_DB", "2")
 	t.Setenv("REDIS_PASSWORD", "secret")
 	t.Setenv("REDIS_KEY_PREFIX", "custom_prefix")
+	t.Setenv("AGGREGATION_WINDOWS", "30s,2m")
 
 	overridden := DefaultConfig()
 	if overridden.KafkaEnabled != false {
@@ -104,16 +109,23 @@ func TestConfigDefaultsAndOverrides(t *testing.T) {
 	if overridden.RedisKeyPrefix != "custom_prefix" {
 		t.Fatalf("expected RedisKeyPrefix 'custom_prefix', got %q", overridden.RedisKeyPrefix)
 	}
+	if len(overridden.AggregationWindows) != 2 || overridden.AggregationWindows["30s"] != 30*time.Second || overridden.AggregationWindows["2m"] != 2*time.Minute {
+		t.Fatalf("expected overridden AggregationWindows [30s, 2m], got %v", overridden.AggregationWindows)
+	}
 
 	// 3. Invalid fallback
 	t.Setenv("KAFKA_ENABLED", "not-a-bool")
 	t.Setenv("REDIS_ENABLED", "not-a-bool")
+	t.Setenv("AGGREGATION_WINDOWS", "invalid,another_invalid")
 	fallback := DefaultConfig()
 	if !fallback.KafkaEnabled {
 		t.Error("invalid KAFKA_ENABLED should fall back to true")
 	}
 	if !fallback.RedisEnabled {
 		t.Error("invalid REDIS_ENABLED should fall back to true")
+	}
+	if len(fallback.AggregationWindows) != 2 || fallback.AggregationWindows["1m"] != 1*time.Minute {
+		t.Error("invalid AGGREGATION_WINDOWS should fall back to default [1m, 5m]")
 	}
 }
 
@@ -140,6 +152,10 @@ func TestNewServiceCreatesRealKafkaConsumerAndRedisWhenEnabled(t *testing.T) {
 	if !isRedisRepo {
 		t.Fatalf("expected real RedisRepository in production mode, got %T", service.Repository())
 	}
+
+	if service.Engine() == nil {
+		t.Fatal("expected non-nil AggregationEngine in Service")
+	}
 }
 
 func TestServiceUsesMemoryRepositoryWhenRedisDisabled(t *testing.T) {
@@ -157,9 +173,10 @@ func TestServiceUsesMemoryRepositoryWhenRedisDisabled(t *testing.T) {
 	}
 }
 
-func TestPipelineProjectsTelemetryAndHealthEventsToRepository(t *testing.T) {
+func TestPipelineProjectsTelemetryHealthAndRollingMetrics(t *testing.T) {
 	repo := store.NewMemoryRepository()
-	pipeline := NewPipeline(repo)
+	engine := aggregation.NewEngine(map[string]time.Duration{"1m": 1 * time.Minute, "5m": 5 * time.Minute})
+	pipeline := NewPipeline(repo, engine)
 	ctx := context.Background()
 
 	now := time.Now().UTC()
@@ -179,6 +196,7 @@ func TestPipelineProjectsTelemetryAndHealthEventsToRepository(t *testing.T) {
 		t.Fatalf("unexpected error from pipeline.HandleTelemetry: %v", err)
 	}
 
+	// 1. Verify latest telemetry stored
 	storedTelem, err := repo.GetLatestTelemetry(ctx, "router-01")
 	if err != nil {
 		t.Fatalf("failed to retrieve stored telemetry: %v", err)
@@ -187,6 +205,24 @@ func TestPipelineProjectsTelemetryAndHealthEventsToRepository(t *testing.T) {
 		t.Fatalf("stored telemetry mismatch: %+v", storedTelem)
 	}
 
+	// 2. Verify rolling metrics stored for both 1m and 5m
+	m1m, err := repo.GetRollingMetrics(ctx, "router-01", "1m")
+	if err != nil {
+		t.Fatalf("failed to retrieve 1m rolling metrics: %v", err)
+	}
+	if m1m.SampleCount != 1 || m1m.AvgCPU != 45.0 || m1m.AvgLatencyMS != 30.0 {
+		t.Fatalf("1m metrics mismatch: %+v", m1m)
+	}
+
+	m5m, err := repo.GetRollingMetrics(ctx, "router-01", "5m")
+	if err != nil {
+		t.Fatalf("failed to retrieve 5m rolling metrics: %v", err)
+	}
+	if m5m.SampleCount != 1 || m5m.AvgMemory != 55.0 {
+		t.Fatalf("5m metrics mismatch: %+v", m5m)
+	}
+
+	// 3. Verify health event stored
 	health := model.HealthEvent{
 		EventID:        "evt-pipe-h1",
 		DeviceID:       "router-01",
@@ -208,11 +244,6 @@ func TestPipelineProjectsTelemetryAndHealthEventsToRepository(t *testing.T) {
 	if storedHealth.EventID != "evt-pipe-h1" || storedHealth.CurrentStatus != "WARNING" {
 		t.Fatalf("stored health mismatch: %+v", storedHealth)
 	}
-
-	devices, err := repo.ListDevices(ctx)
-	if err != nil || len(devices) != 1 || devices[0] != "router-01" {
-		t.Fatalf("expected device router-01 in repository, got %v", devices)
-	}
 }
 
 func TestPipelineSurvivesRepositoryFailureWithoutCrashing(t *testing.T) {
@@ -220,7 +251,8 @@ func TestPipelineSurvivesRepositoryFailureWithoutCrashing(t *testing.T) {
 	repo := store.NewMemoryRepository()
 	_ = repo.Close()
 
-	pipeline := NewPipeline(repo)
+	engine := aggregation.NewEngine(nil)
+	pipeline := NewPipeline(repo, engine)
 	ctx := context.Background()
 
 	// Should not return an error that terminates consumption
@@ -239,11 +271,12 @@ func TestServiceLifecycleAndGracefulShutdown(t *testing.T) {
 	for cycle := 0; cycle < 3; cycle++ {
 		cfg := DefaultConfig()
 		repo := store.NewMemoryRepository()
-		pipeline := NewPipeline(repo)
+		engine := aggregation.NewEngine(cfg.AggregationWindows)
+		pipeline := NewPipeline(repo, engine)
 		dispatcher := consumer.NewDispatcher(pipeline, cfg.TelemetryTopic, cfg.HealthTopic)
 		memConsumer := consumer.NewMemoryConsumer(dispatcher, 10)
 
-		service, err := NewServiceWithDependencies(cfg, pipeline, memConsumer, repo)
+		service, err := NewServiceWithDependencies(cfg, pipeline, memConsumer, repo, engine)
 		if err != nil {
 			t.Fatalf("cycle %d: failed to create service: %v", cycle, err)
 		}
@@ -274,6 +307,12 @@ func TestServiceLifecycleAndGracefulShutdown(t *testing.T) {
 			t.Fatalf("cycle %d: expected telemetry saved before shutdown, got %+v (err=%v)", cycle, res, err)
 		}
 
+		// Verify rolling metrics were also saved
+		m, err := repo.GetRollingMetrics(context.Background(), "router-01", "1m")
+		if err != nil || m.SampleCount != 1 {
+			t.Fatalf("cycle %d: expected rolling metrics saved before shutdown, got %+v (err=%v)", cycle, m, err)
+		}
+
 		cancel()
 
 		select {
@@ -292,7 +331,7 @@ func TestServiceLifecycleKafkaDisabled(t *testing.T) {
 	cfg.KafkaEnabled = false
 
 	repo := store.NewMemoryRepository()
-	service, err := NewServiceWithDependencies(cfg, nil, nil, repo)
+	service, err := NewServiceWithDependencies(cfg, nil, nil, repo, nil)
 	if err != nil {
 		t.Fatalf("failed to create service: %v", err)
 	}
