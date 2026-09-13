@@ -134,7 +134,7 @@ func (h *Handler) handleDevicesRoot(w http.ResponseWriter, r *http.Request) {
 
 	devices, err := h.repo.ListDevices(r.Context())
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to list devices")
+		writeError(w, http.StatusServiceUnavailable, "storage unavailable")
 		return
 	}
 
@@ -184,6 +184,7 @@ func (h *Handler) handleDevicesSubtree(w http.ResponseWriter, r *http.Request) {
 // handleDeviceComplete serves GET /devices/{id}.
 // Returns full composite snapshot: latest telemetry + latest health + 1m rolling metrics + analysis.
 // If any element is missing or not yet ingested for this device, returns 404 Not Found.
+// If the underlying storage fails (e.g. Redis unavailable), returns 503 Service Unavailable.
 func (h *Handler) handleDeviceComplete(w http.ResponseWriter, r *http.Request, deviceID string) {
 	ctx := r.Context()
 
@@ -193,7 +194,7 @@ func (h *Handler) handleDeviceComplete(w http.ResponseWriter, r *http.Request, d
 			writeError(w, http.StatusNotFound, "device state incomplete: latest telemetry not found")
 			return
 		}
-		writeError(w, http.StatusInternalServerError, "storage error retrieving telemetry")
+		writeError(w, http.StatusServiceUnavailable, "storage unavailable")
 		return
 	}
 
@@ -203,7 +204,7 @@ func (h *Handler) handleDeviceComplete(w http.ResponseWriter, r *http.Request, d
 			writeError(w, http.StatusNotFound, "device state incomplete: latest health not found")
 			return
 		}
-		writeError(w, http.StatusInternalServerError, "storage error retrieving health")
+		writeError(w, http.StatusServiceUnavailable, "storage unavailable")
 		return
 	}
 
@@ -213,7 +214,7 @@ func (h *Handler) handleDeviceComplete(w http.ResponseWriter, r *http.Request, d
 			writeError(w, http.StatusNotFound, "device state incomplete: 1m rolling metrics not found")
 			return
 		}
-		writeError(w, http.StatusInternalServerError, "storage error retrieving rolling metrics")
+		writeError(w, http.StatusServiceUnavailable, "storage unavailable")
 		return
 	}
 
@@ -223,7 +224,7 @@ func (h *Handler) handleDeviceComplete(w http.ResponseWriter, r *http.Request, d
 			writeError(w, http.StatusNotFound, "device state incomplete: device analysis not found")
 			return
 		}
-		writeError(w, http.StatusInternalServerError, "storage error retrieving device analysis")
+		writeError(w, http.StatusServiceUnavailable, "storage unavailable")
 		return
 	}
 
@@ -246,7 +247,7 @@ func (h *Handler) handleDeviceTelemetry(w http.ResponseWriter, r *http.Request, 
 			writeError(w, http.StatusNotFound, "telemetry not found for device")
 			return
 		}
-		writeError(w, http.StatusInternalServerError, "storage error retrieving telemetry")
+		writeError(w, http.StatusServiceUnavailable, "storage unavailable")
 		return
 	}
 
@@ -268,7 +269,7 @@ func (h *Handler) handleDeviceTelemetry(w http.ResponseWriter, r *http.Request, 
 
 		metrics, err := h.repo.GetRollingMetrics(ctx, deviceID, windowParam)
 		if err != nil && !errors.Is(err, store.ErrNotFound) {
-			writeError(w, http.StatusInternalServerError, "storage error retrieving rolling metrics")
+			writeError(w, http.StatusServiceUnavailable, "storage unavailable")
 			return
 		}
 
@@ -312,7 +313,7 @@ func (h *Handler) handleDeviceHealth(w http.ResponseWriter, r *http.Request, dev
 			writeError(w, http.StatusNotFound, "health not found for device")
 			return
 		}
-		writeError(w, http.StatusInternalServerError, "storage error retrieving health")
+		writeError(w, http.StatusServiceUnavailable, "storage unavailable")
 		return
 	}
 
@@ -329,7 +330,7 @@ func (h *Handler) handleDeviceAnalysis(w http.ResponseWriter, r *http.Request, d
 			writeError(w, http.StatusNotFound, "analysis not found for device")
 			return
 		}
-		writeError(w, http.StatusInternalServerError, "storage error retrieving analysis")
+		writeError(w, http.StatusServiceUnavailable, "storage unavailable")
 		return
 	}
 

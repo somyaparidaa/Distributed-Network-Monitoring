@@ -136,6 +136,20 @@ func TestDevicesRootEndpoint(t *testing.T) {
 	if recPost.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("expected 405 on POST /devices, got %d", recPost.Code)
 	}
+
+	// 4. Storage failure returns 503 Service Unavailable with {"error":"storage unavailable"}
+	_ = repo.Close()
+	reqDown := httptest.NewRequest(http.MethodGet, "/devices", nil)
+	recDown := httptest.NewRecorder()
+	handler.Routes().ServeHTTP(recDown, reqDown)
+	if recDown.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 on closed repo, got %d", recDown.Code)
+	}
+	var errResp errorResponse
+	_ = json.Unmarshal(recDown.Body.Bytes(), &errResp)
+	if errResp.Error != "storage unavailable" {
+		t.Fatalf("expected 'storage unavailable', got %q", errResp.Error)
+	}
 }
 
 func TestDeviceCompleteSnapshot(t *testing.T) {
