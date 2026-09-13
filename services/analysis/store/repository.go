@@ -12,7 +12,7 @@ import (
 // ErrNotFound indicates that the requested device state key was not found in storage.
 var ErrNotFound = errors.New("device state not found")
 
-// DeviceStateRepository defines the contract for persisting and retrieving latest device state and rolling metrics.
+// DeviceStateRepository defines the contract for persisting and retrieving latest device state, rolling metrics, and device analysis.
 type DeviceStateRepository interface {
 	SaveLatestTelemetry(ctx context.Context, deviceID string, event model.TelemetryEvent) error
 	SaveLatestHealth(ctx context.Context, deviceID string, event model.HealthEvent) error
@@ -22,6 +22,9 @@ type DeviceStateRepository interface {
 
 	SaveRollingMetrics(ctx context.Context, metrics model.RollingMetrics) error
 	GetRollingMetrics(ctx context.Context, deviceID string, window string) (*model.RollingMetrics, error)
+
+	SaveDeviceAnalysis(ctx context.Context, analysis model.DeviceAnalysis) error
+	GetDeviceAnalysis(ctx context.Context, deviceID string) (*model.DeviceAnalysis, error)
 
 	Close() error
 }
@@ -33,6 +36,7 @@ type MemoryRepository struct {
 	telemetry map[string]model.TelemetryEvent
 	health    map[string]model.HealthEvent
 	metrics   map[string]model.RollingMetrics // key: deviceID + ":" + window
+	analyses  map[string]model.DeviceAnalysis // key: deviceID
 	closed    bool
 }
 
@@ -43,6 +47,7 @@ func NewMemoryRepository() *MemoryRepository {
 		telemetry: make(map[string]model.TelemetryEvent),
 		health:    make(map[string]model.HealthEvent),
 		metrics:   make(map[string]model.RollingMetrics),
+		analyses:  make(map[string]model.DeviceAnalysis),
 	}
 }
 
@@ -154,6 +159,42 @@ func (m *MemoryRepository) GetRollingMetrics(ctx context.Context, deviceID strin
 		return nil, ErrNotFound
 	}
 	return &metrics, nil
+}
+
+// SaveDeviceAnalysis stores the latest device analysis result.
+func (m *MemoryRepository) SaveDeviceAnalysis(ctx context.Context, analysis model.DeviceAnalysis) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.closed {
+		return errors.New("repository is closed")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	m.devices[analysis.DeviceID] = struct{}{}
+	m.analyses[analysis.DeviceID] = analysis
+	return nil
+}
+
+// GetDeviceAnalysis retrieves the latest device analysis result.
+func (m *MemoryRepository) GetDeviceAnalysis(ctx context.Context, deviceID string) (*model.DeviceAnalysis, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if m.closed {
+		return nil, errors.New("repository is closed")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	analysis, exists := m.analyses[deviceID]
+	if !exists {
+		return nil, ErrNotFound
+	}
+	return &analysis, nil
 }
 
 // ListDevices returns all known device IDs.

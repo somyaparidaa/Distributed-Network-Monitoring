@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"distributed-network-monitor/services/analysis/aggregation"
+	"distributed-network-monitor/services/analysis/anomaly"
 	"distributed-network-monitor/services/analysis/consumer"
 	"distributed-network-monitor/services/analysis/model"
 	"distributed-network-monitor/services/analysis/store"
@@ -156,6 +157,10 @@ func TestNewServiceCreatesRealKafkaConsumerAndRedisWhenEnabled(t *testing.T) {
 	if service.Engine() == nil {
 		t.Fatal("expected non-nil AggregationEngine in Service")
 	}
+
+	if service.Detector() == nil {
+		t.Fatal("expected non-nil AnomalyDetector in Service")
+	}
 }
 
 func TestServiceUsesMemoryRepositoryWhenRedisDisabled(t *testing.T) {
@@ -173,14 +178,17 @@ func TestServiceUsesMemoryRepositoryWhenRedisDisabled(t *testing.T) {
 	}
 }
 
-func TestPipelineProjectsTelemetryHealthAndRollingMetrics(t *testing.T) {
+func TestPipelineProjectsTelemetryHealthRollingMetricsAndAnalysis(t *testing.T) {
 	repo := store.NewMemoryRepository()
 	engine := aggregation.NewEngine(map[string]time.Duration{"1m": 1 * time.Minute, "5m": 5 * time.Minute})
-	pipeline := NewPipeline(repo, engine)
+	detector := anomaly.NewDetector("1m")
+	pipeline := NewPipeline(repo, engine, detector)
 	ctx := context.Background()
 
 	now := time.Now().UTC()
-	telem := model.TelemetryEvent{
+
+	// 1. Ingest sample 1 (normal)
+	telem1 := model.TelemetryEvent{
 		EventID:      "evt-pipe-1",
 		DeviceID:     "router-01",
 		Timestamp:    now,
@@ -191,46 +199,75 @@ func TestPipelineProjectsTelemetryHealthAndRollingMetrics(t *testing.T) {
 		InterfaceUp:  true,
 		Connectivity: true,
 	}
-
-	if err := pipeline.HandleTelemetry(ctx, telem); err != nil {
+	if err := pipeline.HandleTelemetry(ctx, telem1); err != nil {
 		t.Fatalf("unexpected error from pipeline.HandleTelemetry: %v", err)
 	}
 
-	// 1. Verify latest telemetry stored
+	// 2. Ingest sample 2 with sustained critical latency (160ms) and high CPU (85%)
+	telem2 := model.TelemetryEvent{
+		EventID:      "evt-pipe-2",
+		DeviceID:     "router-01",
+		Timestamp:    now.Add(10 * time.Second),
+		CPU:          85.0,
+		Memory:       60.0,
+		LatencyMS:    160,
+		PacketLoss:   0.0,
+		InterfaceUp:  true,
+		Connectivity: true,
+	}
+	if err := pipeline.HandleTelemetry(ctx, telem2); err != nil {
+		t.Fatalf("unexpected error from pipeline.HandleTelemetry: %v", err)
+	}
+
+	// Verify latest telemetry stored
 	storedTelem, err := repo.GetLatestTelemetry(ctx, "router-01")
 	if err != nil {
 		t.Fatalf("failed to retrieve stored telemetry: %v", err)
 	}
-	if storedTelem.EventID != "evt-pipe-1" || storedTelem.CPU != 45.0 {
+	if storedTelem.EventID != "evt-pipe-2" {
 		t.Fatalf("stored telemetry mismatch: %+v", storedTelem)
 	}
 
-	// 2. Verify rolling metrics stored for both 1m and 5m
+	// Verify rolling metrics stored
 	m1m, err := repo.GetRollingMetrics(ctx, "router-01", "1m")
 	if err != nil {
 		t.Fatalf("failed to retrieve 1m rolling metrics: %v", err)
 	}
-	if m1m.SampleCount != 1 || m1m.AvgCPU != 45.0 || m1m.AvgLatencyMS != 30.0 {
-		t.Fatalf("1m metrics mismatch: %+v", m1m)
+	if m1m.SampleCount != 2 {
+		t.Fatalf("expected 2 samples, got %d", m1m.SampleCount)
 	}
 
-	m5m, err := repo.GetRollingMetrics(ctx, "router-01", "5m")
+	// Verify DeviceAnalysis generated and stored
+	analysis, err := repo.GetDeviceAnalysis(ctx, "router-01")
 	if err != nil {
-		t.Fatalf("failed to retrieve 5m rolling metrics: %v", err)
+		t.Fatalf("failed to retrieve device analysis: %v", err)
 	}
-	if m5m.SampleCount != 1 || m5m.AvgMemory != 55.0 {
-		t.Fatalf("5m metrics mismatch: %+v", m5m)
+	// Avg latency: (30 + 160) / 2 = 95.0ms -> WARNING (>= 50.0)
+	if len(analysis.ActiveAnomalies) == 0 {
+		t.Fatalf("expected active anomalies for high latency, got none")
+	}
+	foundLatency := false
+	for _, a := range analysis.ActiveAnomalies {
+		if a.Signal == "LATENCY" {
+			foundLatency = true
+			if a.Severity != model.SeverityWarning {
+				t.Fatalf("expected Warning latency anomaly, got %v", a.Severity)
+			}
+		}
+	}
+	if !foundLatency {
+		t.Fatalf("expected LATENCY anomaly, got %+v", analysis.ActiveAnomalies)
 	}
 
-	// 3. Verify health event stored
+	// 3. Verify health event evaluates health anomaly and saves analysis
 	health := model.HealthEvent{
 		EventID:        "evt-pipe-h1",
 		DeviceID:       "router-01",
-		Timestamp:      now,
+		Timestamp:      now.Add(15 * time.Second),
 		PreviousStatus: "HEALTHY",
-		CurrentStatus:  "WARNING",
-		Score:          25,
-		Reasons:        []string{"high latency"},
+		CurrentStatus:  "DOWN",
+		Score:          100,
+		Reasons:        []string{"connection lost"},
 	}
 
 	if err := pipeline.HandleHealth(ctx, health); err != nil {
@@ -241,8 +278,23 @@ func TestPipelineProjectsTelemetryHealthAndRollingMetrics(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to retrieve stored health: %v", err)
 	}
-	if storedHealth.EventID != "evt-pipe-h1" || storedHealth.CurrentStatus != "WARNING" {
+	if storedHealth.CurrentStatus != "DOWN" {
 		t.Fatalf("stored health mismatch: %+v", storedHealth)
+	}
+
+	healthAnalysis, err := repo.GetDeviceAnalysis(ctx, "router-01")
+	if err != nil {
+		t.Fatalf("failed to retrieve device analysis: %v", err)
+	}
+	foundHealth := false
+	for _, a := range healthAnalysis.ActiveAnomalies {
+		if a.Signal == "HEALTH" && a.Severity == model.SeverityCritical {
+			foundHealth = true
+			break
+		}
+	}
+	if !foundHealth {
+		t.Fatalf("expected Critical HEALTH anomaly after DOWN event, got %+v", healthAnalysis.ActiveAnomalies)
 	}
 }
 
@@ -252,7 +304,8 @@ func TestPipelineSurvivesRepositoryFailureWithoutCrashing(t *testing.T) {
 	_ = repo.Close()
 
 	engine := aggregation.NewEngine(nil)
-	pipeline := NewPipeline(repo, engine)
+	detector := anomaly.NewDetector("1m")
+	pipeline := NewPipeline(repo, engine, detector)
 	ctx := context.Background()
 
 	// Should not return an error that terminates consumption
@@ -272,11 +325,12 @@ func TestServiceLifecycleAndGracefulShutdown(t *testing.T) {
 		cfg := DefaultConfig()
 		repo := store.NewMemoryRepository()
 		engine := aggregation.NewEngine(cfg.AggregationWindows)
-		pipeline := NewPipeline(repo, engine)
+		detector := anomaly.NewDetector("1m")
+		pipeline := NewPipeline(repo, engine, detector)
 		dispatcher := consumer.NewDispatcher(pipeline, cfg.TelemetryTopic, cfg.HealthTopic)
 		memConsumer := consumer.NewMemoryConsumer(dispatcher, 10)
 
-		service, err := NewServiceWithDependencies(cfg, pipeline, memConsumer, repo, engine)
+		service, err := NewServiceWithDependencies(cfg, pipeline, memConsumer, repo, engine, detector)
 		if err != nil {
 			t.Fatalf("cycle %d: failed to create service: %v", cycle, err)
 		}
@@ -307,10 +361,16 @@ func TestServiceLifecycleAndGracefulShutdown(t *testing.T) {
 			t.Fatalf("cycle %d: expected telemetry saved before shutdown, got %+v (err=%v)", cycle, res, err)
 		}
 
-		// Verify rolling metrics were also saved
+		// Verify rolling metrics were saved
 		m, err := repo.GetRollingMetrics(context.Background(), "router-01", "1m")
 		if err != nil || m.SampleCount != 1 {
 			t.Fatalf("cycle %d: expected rolling metrics saved before shutdown, got %+v (err=%v)", cycle, m, err)
+		}
+
+		// Verify analysis was saved
+		a, err := repo.GetDeviceAnalysis(context.Background(), "router-01")
+		if err != nil || a.DeviceID != "router-01" {
+			t.Fatalf("cycle %d: expected analysis saved before shutdown, got %+v (err=%v)", cycle, a, err)
 		}
 
 		cancel()
@@ -331,7 +391,7 @@ func TestServiceLifecycleKafkaDisabled(t *testing.T) {
 	cfg.KafkaEnabled = false
 
 	repo := store.NewMemoryRepository()
-	service, err := NewServiceWithDependencies(cfg, nil, nil, repo, nil)
+	service, err := NewServiceWithDependencies(cfg, nil, nil, repo, nil, nil)
 	if err != nil {
 		t.Fatalf("failed to create service: %v", err)
 	}

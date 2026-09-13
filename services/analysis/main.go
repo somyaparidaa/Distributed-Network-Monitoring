@@ -10,32 +10,40 @@ import (
 	"syscall"
 
 	"distributed-network-monitor/services/analysis/aggregation"
+	"distributed-network-monitor/services/analysis/anomaly"
 	"distributed-network-monitor/services/analysis/consumer"
 	"distributed-network-monitor/services/analysis/model"
 	"distributed-network-monitor/services/analysis/store"
 )
 
 // Pipeline represents the telemetry intelligence and analysis pipeline.
-// In NETMON-3.3, Pipeline:
-// 1. Projects latest telemetry and health events into the DeviceStateRepository.
+// In NETMON-3.4, Pipeline:
+// 1. Projects latest telemetry and health events into DeviceStateRepository.
 // 2. Feeds telemetry events into the in-memory AggregationEngine.
-// 3. Persists the resulting time-windowed RollingMetrics into the DeviceStateRepository.
+// 3. Persists time-windowed RollingMetrics into DeviceStateRepository.
+// 4. Evaluates rolling metrics and health transitions using the deterministic AnomalyDetector.
+// 5. Persists the resulting DeviceAnalysis summary into DeviceStateRepository under analysis:device:{id}:analysis.
 type Pipeline struct {
-	repo   store.DeviceStateRepository
-	engine *aggregation.Engine
+	repo     store.DeviceStateRepository
+	engine   *aggregation.Engine
+	detector *anomaly.Detector
 }
 
-// NewPipeline constructs an event processing pipeline instance backed by a DeviceStateRepository and Aggregation Engine.
-func NewPipeline(repo store.DeviceStateRepository, engine *aggregation.Engine) *Pipeline {
+// NewPipeline constructs an event processing pipeline instance backed by storage, aggregation, and anomaly detection.
+func NewPipeline(repo store.DeviceStateRepository, engine *aggregation.Engine, detector *anomaly.Detector) *Pipeline {
 	if repo == nil {
 		repo = store.NewMemoryRepository()
 	}
 	if engine == nil {
 		engine = aggregation.NewEngine(nil)
 	}
+	if detector == nil {
+		detector = anomaly.NewDetector("1m")
+	}
 	return &Pipeline{
-		repo:   repo,
-		engine: engine,
+		repo:     repo,
+		engine:   engine,
+		detector: detector,
 	}
 }
 
@@ -49,7 +57,13 @@ func (p *Pipeline) Engine() *aggregation.Engine {
 	return p.engine
 }
 
-// HandleTelemetry projects decoded telemetry events into storage and computes rolling window statistics.
+// Detector returns the underlying anomaly detector.
+func (p *Pipeline) Detector() *anomaly.Detector {
+	return p.detector
+}
+
+// HandleTelemetry projects decoded telemetry events into storage, computes rolling window statistics,
+// evaluates anomaly rules, and persists device analysis.
 // Redis/storage errors are logged as warnings and do NOT terminate consumption.
 func (p *Pipeline) HandleTelemetry(ctx context.Context, event model.TelemetryEvent) error {
 	log.Printf("[ANALYSIS] received telemetry event [%s] from device [%s] (CPU: %.1f%%, Latency: %dms, Loss: %.2f%%)",
@@ -70,19 +84,37 @@ func (p *Pipeline) HandleTelemetry(ctx context.Context, event model.TelemetryEve
 		}
 	}
 
+	// 4. Evaluate rolling metrics with AnomalyDetector
+	analysis := p.detector.EvaluateMetrics(event.DeviceID, metrics)
+
+	// 5. Persist latest DeviceAnalysis
+	if err := p.repo.SaveDeviceAnalysis(ctx, analysis); err != nil {
+		log.Printf("[ANALYSIS] warning: failed to save device analysis for device [%s] to repository: %v", event.DeviceID, err)
+	}
+
 	return nil
 }
 
-// HandleHealth projects decoded health state transition events into storage.
+// HandleHealth projects decoded health state transition events into storage, evaluates health anomalies,
+// and updates device analysis.
 // Redis/storage errors are logged as warnings and do NOT terminate consumption.
 func (p *Pipeline) HandleHealth(ctx context.Context, event model.HealthEvent) error {
 	log.Printf("[ANALYSIS] received health transition event [%s] for device [%s]: %s -> %s (score: %d)",
 		event.EventID, event.DeviceID, event.PreviousStatus, event.CurrentStatus, event.Score)
 
+	// 1. Persist latest health assessment
 	if err := p.repo.SaveLatestHealth(ctx, event.DeviceID, event); err != nil {
 		log.Printf("[ANALYSIS] warning: failed to project latest health for device [%s] to repository: %v", event.DeviceID, err)
-		return nil
 	}
+
+	// 2. Evaluate health anomaly
+	analysis := p.detector.EvaluateHealth(event)
+
+	// 3. Persist updated DeviceAnalysis
+	if err := p.repo.SaveDeviceAnalysis(ctx, analysis); err != nil {
+		log.Printf("[ANALYSIS] warning: failed to save device analysis on health event for device [%s] to repository: %v", event.DeviceID, err)
+	}
+
 	return nil
 }
 
@@ -94,26 +126,28 @@ type Service struct {
 	pipeline   consumer.Handler
 	repo       store.DeviceStateRepository
 	engine     *aggregation.Engine
+	detector   *anomaly.Detector
 	stopOnce   sync.Once
 }
 
 // NewService constructs a new Service from the provided configuration.
 func NewService(cfg Config, handler consumer.Handler) (*Service, error) {
-	return NewServiceWithDependencies(cfg, handler, nil, nil, nil)
+	return NewServiceWithDependencies(cfg, handler, nil, nil, nil, nil)
 }
 
 // NewServiceWithConsumer allows injecting a custom Consumer (e.g. MemoryConsumer in tests).
 func NewServiceWithConsumer(cfg Config, handler consumer.Handler, injectedConsumer consumer.Consumer) (*Service, error) {
-	return NewServiceWithDependencies(cfg, handler, injectedConsumer, nil, nil)
+	return NewServiceWithDependencies(cfg, handler, injectedConsumer, nil, nil, nil)
 }
 
-// NewServiceWithDependencies allows injecting custom Consumer, DeviceStateRepository, and Engine implementations for testing.
+// NewServiceWithDependencies allows injecting custom Consumer, DeviceStateRepository, Engine, and Detector implementations for testing.
 func NewServiceWithDependencies(
 	cfg Config,
 	handler consumer.Handler,
 	injectedConsumer consumer.Consumer,
 	injectedRepo store.DeviceStateRepository,
 	injectedEngine *aggregation.Engine,
+	injectedDetector *anomaly.Detector,
 ) (*Service, error) {
 	// Initialize repository
 	var repo store.DeviceStateRepository
@@ -142,8 +176,16 @@ func NewServiceWithDependencies(
 		engine = aggregation.NewEngine(cfg.AggregationWindows)
 	}
 
+	// Initialize anomaly detector
+	var detector *anomaly.Detector
+	if injectedDetector != nil {
+		detector = injectedDetector
+	} else {
+		detector = anomaly.NewDetector("1m")
+	}
+
 	if handler == nil {
-		handler = NewPipeline(repo, engine)
+		handler = NewPipeline(repo, engine, detector)
 	}
 
 	dispatcher := consumer.NewDispatcher(handler, cfg.TelemetryTopic, cfg.HealthTopic)
@@ -170,6 +212,7 @@ func NewServiceWithDependencies(
 		pipeline:   handler,
 		repo:       repo,
 		engine:     engine,
+		detector:   detector,
 	}, nil
 }
 
@@ -196,6 +239,11 @@ func (s *Service) Repository() store.DeviceStateRepository {
 // Engine returns the underlying aggregation engine.
 func (s *Service) Engine() *aggregation.Engine {
 	return s.engine
+}
+
+// Detector returns the underlying anomaly detector.
+func (s *Service) Detector() *anomaly.Detector {
+	return s.detector
 }
 
 // Run executes the analysis service lifecycle until ctx is cancelled.

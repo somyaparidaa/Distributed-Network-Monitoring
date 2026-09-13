@@ -193,3 +193,41 @@ func (r *RedisRepository) GetRollingMetrics(ctx context.Context, deviceID string
 	}
 	return &metrics, nil
 }
+
+func (r *RedisRepository) analysisKey(deviceID string) string {
+	return fmt.Sprintf("%s:device:%s:analysis", r.prefix, deviceID)
+}
+
+// SaveDeviceAnalysis serializes DeviceAnalysis to JSON and stores it under analysis:device:{id}:analysis with NO TTL.
+func (r *RedisRepository) SaveDeviceAnalysis(ctx context.Context, analysis model.DeviceAnalysis) error {
+	data, err := json.Marshal(analysis)
+	if err != nil {
+		return fmt.Errorf("marshal device analysis: %w", err)
+	}
+
+	pipe := r.client.Pipeline()
+	pipe.Set(ctx, r.analysisKey(analysis.DeviceID), data, 0)
+	pipe.SAdd(ctx, r.devicesKey(), analysis.DeviceID)
+
+	if _, err := pipe.Exec(ctx); err != nil {
+		return fmt.Errorf("save device analysis in redis: %w", err)
+	}
+	return nil
+}
+
+// GetDeviceAnalysis retrieves and deserializes the latest device analysis for a device.
+func (r *RedisRepository) GetDeviceAnalysis(ctx context.Context, deviceID string) (*model.DeviceAnalysis, error) {
+	val, err := r.client.Get(ctx, r.analysisKey(deviceID)).Bytes()
+	if err != nil {
+		if errors.Is(err, redis.Nil) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("get device analysis from redis: %w", err)
+	}
+
+	var analysis model.DeviceAnalysis
+	if err := json.Unmarshal(val, &analysis); err != nil {
+		return nil, fmt.Errorf("unmarshal device analysis from redis: %w", err)
+	}
+	return &analysis, nil
+}

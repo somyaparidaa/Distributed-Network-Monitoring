@@ -282,3 +282,91 @@ func TestLiveRedisRollingMetrics(t *testing.T) {
 		t.Fatalf("fetched metrics mismatch: %+v", fetched)
 	}
 }
+
+func TestMemoryRepositoryDeviceAnalysis(t *testing.T) {
+	repo := NewMemoryRepository()
+	defer repo.Close()
+
+	ctx := context.Background()
+
+	// Missing analysis returns ErrNotFound
+	_, err := repo.GetDeviceAnalysis(ctx, "router-01")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound for missing analysis, got: %v", err)
+	}
+
+	analysis := model.DeviceAnalysis{
+		DeviceID: "router-01",
+		ActiveAnomalies: []model.Anomaly{
+			{
+				Signal:    "LATENCY",
+				Severity:  model.SeverityWarning,
+				Value:     55.0,
+				Threshold: 50.0,
+				Reason:    "sustained high latency",
+			},
+		},
+		CalculatedAt: time.Now().UTC(),
+	}
+
+	if err := repo.SaveDeviceAnalysis(ctx, analysis); err != nil {
+		t.Fatalf("failed to save device analysis: %v", err)
+	}
+
+	fetched, err := repo.GetDeviceAnalysis(ctx, "router-01")
+	if err != nil {
+		t.Fatalf("failed to get device analysis: %v", err)
+	}
+	if len(fetched.ActiveAnomalies) != 1 || fetched.ActiveAnomalies[0].Signal != "LATENCY" {
+		t.Fatalf("analysis mismatch: %+v", fetched)
+	}
+}
+
+func TestLiveRedisDeviceAnalysis(t *testing.T) {
+	conn, err := net.DialTimeout("tcp", "localhost:6379", 200*time.Millisecond)
+	if err != nil {
+		t.Skip("Redis not available on localhost:6379, skipping live Redis integration test")
+	}
+	_ = conn.Close()
+
+	cfg := RedisConfig{
+		Addr:      "localhost:6379",
+		DB:        15,
+		KeyPrefix: "test_analysis_anomaly",
+	}
+
+	repo, err := NewRedisRepository(cfg)
+	if err != nil {
+		t.Fatalf("failed to initialize live RedisRepository: %v", err)
+	}
+	defer repo.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	analysis := model.DeviceAnalysis{
+		DeviceID: "router-live-analysis-01",
+		ActiveAnomalies: []model.Anomaly{
+			{
+				Signal:    "CPU",
+				Severity:  model.SeverityCritical,
+				Value:     92.5,
+				Threshold: 90.0,
+				Reason:    "sustained critical CPU",
+			},
+		},
+		CalculatedAt: time.Now().UTC().Truncate(time.Millisecond),
+	}
+
+	if err := repo.SaveDeviceAnalysis(ctx, analysis); err != nil {
+		t.Fatalf("failed to save device analysis to live Redis: %v", err)
+	}
+
+	fetched, err := repo.GetDeviceAnalysis(ctx, "router-live-analysis-01")
+	if err != nil {
+		t.Fatalf("failed to get device analysis from live Redis: %v", err)
+	}
+	if len(fetched.ActiveAnomalies) != 1 || fetched.ActiveAnomalies[0].Signal != "CPU" || fetched.ActiveAnomalies[0].Severity != model.SeverityCritical {
+		t.Fatalf("fetched analysis mismatch: %+v", fetched)
+	}
+}
