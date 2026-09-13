@@ -21,6 +21,7 @@ type Config struct {
 	RedisPassword  string
 	RedisKeyPrefix string
 
+	HTTPAddr           string
 	AggregationWindows map[string]time.Duration
 }
 
@@ -89,6 +90,13 @@ func DefaultConfig() Config {
 		redisKeyPrefix = strings.TrimSpace(val)
 	}
 
+	httpAddr := ":8082"
+	if val := os.Getenv("ANALYSIS_HTTP_ADDR"); strings.TrimSpace(val) != "" {
+		httpAddr = strings.TrimSpace(val)
+	} else if val := os.Getenv("HTTP_ADDR"); strings.TrimSpace(val) != "" {
+		httpAddr = strings.TrimSpace(val)
+	}
+
 	aggregationWindows := map[string]time.Duration{
 		"1m": 1 * time.Minute,
 		"5m": 5 * time.Minute,
@@ -111,6 +119,7 @@ func DefaultConfig() Config {
 		RedisDB:            redisDB,
 		RedisPassword:      redisPassword,
 		RedisKeyPrefix:     redisKeyPrefix,
+		HTTPAddr:           httpAddr,
 		AggregationWindows: aggregationWindows,
 	}
 }

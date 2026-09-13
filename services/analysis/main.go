@@ -2,15 +2,19 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"sync"
 	"syscall"
+	"time"
 
 	"distributed-network-monitor/services/analysis/aggregation"
 	"distributed-network-monitor/services/analysis/anomaly"
+	"distributed-network-monitor/services/analysis/api"
 	"distributed-network-monitor/services/analysis/consumer"
 	"distributed-network-monitor/services/analysis/model"
 	"distributed-network-monitor/services/analysis/store"
@@ -118,7 +122,7 @@ func (p *Pipeline) HandleHealth(ctx context.Context, event model.HealthEvent) er
 	return nil
 }
 
-// Service coordinates the analysis service lifecycle and manages event consumption.
+// Service coordinates the analysis service lifecycle, event consumption, and HTTP read API.
 type Service struct {
 	cfg        Config
 	consumer   consumer.Consumer
@@ -127,6 +131,8 @@ type Service struct {
 	repo       store.DeviceStateRepository
 	engine     *aggregation.Engine
 	detector   *anomaly.Detector
+	apiHandler *api.Handler
+	httpAddr   string
 	stopOnce   sync.Once
 }
 
@@ -205,6 +211,8 @@ func NewServiceWithDependencies(
 		}
 	}
 
+	apiHandler := api.NewHandler(repo, cfg.KafkaEnabled, cfg.RedisEnabled, cfg.AggregationWindows)
+
 	return &Service{
 		cfg:        cfg,
 		consumer:   c,
@@ -213,6 +221,8 @@ func NewServiceWithDependencies(
 		repo:       repo,
 		engine:     engine,
 		detector:   detector,
+		apiHandler: apiHandler,
+		httpAddr:   cfg.HTTPAddr,
 	}, nil
 }
 
@@ -246,61 +256,91 @@ func (s *Service) Detector() *anomaly.Detector {
 	return s.detector
 }
 
-// Run executes the analysis service lifecycle until ctx is cancelled.
-func (s *Service) Run(ctx context.Context) error {
-	log.Printf("analysis service started; consumer_group=%s topics=[%s, %s] brokers=%v kafka_enabled=%v redis_enabled=%v redis_addr=%s",
-		s.cfg.ConsumerGroup, s.cfg.TelemetryTopic, s.cfg.HealthTopic, s.cfg.KafkaBrokers, s.cfg.KafkaEnabled, s.cfg.RedisEnabled, s.cfg.RedisAddr)
+// APIHandler returns the HTTP API handler.
+func (s *Service) APIHandler() *api.Handler {
+	return s.apiHandler
+}
 
-	if !s.cfg.KafkaEnabled || s.consumer == nil {
-		log.Println("analysis service: kafka consumption is disabled, awaiting shutdown signal")
-		<-ctx.Done()
-		log.Println("analysis service shutdown requested")
-		if s.repo != nil {
-			_ = s.repo.Close()
-		}
-		return nil
+// Run executes the analysis service lifecycle until ctx is cancelled.
+//
+// Lifecycle sequence:
+//  1. Start HTTP Read API server on configured HTTPAddr.
+//  2. Start Kafka consumer worker (if KafkaEnabled).
+//  3. On context cancellation or server error, shut down in reverse order:
+//     a. HTTP server stops accepting requests (Shutdown).
+//     b. Kafka consumer worker stops and closes.
+//     c. DeviceStateRepository closes.
+func (s *Service) Run(ctx context.Context) error {
+	log.Printf("analysis service started; http_addr=%s consumer_group=%s topics=[%s, %s] brokers=%v kafka_enabled=%v redis_enabled=%v redis_addr=%s",
+		s.httpAddr, s.cfg.ConsumerGroup, s.cfg.TelemetryTopic, s.cfg.HealthTopic, s.cfg.KafkaBrokers, s.cfg.KafkaEnabled, s.cfg.RedisEnabled, s.cfg.RedisAddr)
+
+	server := &http.Server{
+		Addr:    s.httpAddr,
+		Handler: s.apiHandler.Routes(),
 	}
+
+	serverErr := make(chan error, 1)
+	go func() {
+		log.Printf("analysis HTTP read API listening on %s", s.httpAddr)
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serverErr <- err
+		}
+		close(serverErr)
+	}()
 
 	consumerCtx, cancelConsumer := context.WithCancel(context.Background())
 	defer cancelConsumer()
 
-	errCh := make(chan error, 1)
-	go func() {
-		if err := s.consumer.Start(consumerCtx); err != nil && err != context.Canceled {
-			errCh <- err
-		}
-		close(errCh)
-	}()
+	consumerErr := make(chan error, 1)
+	if s.cfg.KafkaEnabled && s.consumer != nil {
+		go func() {
+			if err := s.consumer.Start(consumerCtx); err != nil && !errors.Is(err, context.Canceled) {
+				consumerErr <- err
+			}
+			close(consumerErr)
+		}()
+	} else {
+		log.Println("analysis service: kafka consumption is disabled, running HTTP API only")
+	}
 
+	var runErr error
 	select {
-	case err := <-errCh:
-		cancelConsumer()
-		if s.repo != nil {
-			_ = s.repo.Close()
-		}
+	case err := <-serverErr:
 		if err != nil {
-			return fmt.Errorf("consumer runtime error: %w", err)
+			runErr = fmt.Errorf("analysis http server error: %w", err)
 		}
-		return nil
+	case err := <-consumerErr:
+		if err != nil {
+			runErr = fmt.Errorf("consumer runtime error: %w", err)
+		}
 	case <-ctx.Done():
 		log.Println("analysis service shutdown requested...")
 	}
 
-	// 1. Stop consumer loop
-	cancelConsumer()
+	// 1. Gracefully shut down HTTP server
+	shutdownCtx, cancelHTTP := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancelHTTP()
 
-	// 2. Close consumer resources
-	if err := s.consumer.Close(); err != nil {
-		log.Printf("[ANALYSIS] error closing consumer: %v", err)
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		log.Printf("[ANALYSIS] http server shutdown error: %v", err)
 	} else {
-		log.Println("consumer resources closed cleanly")
+		log.Println("analysis http server stopped gracefully")
+	}
+	<-serverErr
+
+	// 2. Stop and close consumer
+	cancelConsumer()
+	if s.cfg.KafkaEnabled && s.consumer != nil {
+		if err := s.consumer.Close(); err != nil {
+			log.Printf("[ANALYSIS] error closing consumer: %v", err)
+		} else {
+			log.Println("consumer resources closed cleanly")
+		}
+		<-consumerErr
+		log.Println("consumer worker exited cleanly")
 	}
 
-	// Wait for consumer worker to finish
-	<-errCh
-	log.Println("consumer worker exited cleanly")
-
-	// 3. Close repository resources
+	// 3. Close repository
 	if s.repo != nil {
 		if err := s.repo.Close(); err != nil {
 			log.Printf("[ANALYSIS] error closing repository: %v", err)
@@ -309,7 +349,7 @@ func (s *Service) Run(ctx context.Context) error {
 		}
 	}
 
-	return nil
+	return runErr
 }
 
 func main() {

@@ -94,9 +94,18 @@ func TestMemoryRepositoryOperations(t *testing.T) {
 		t.Fatalf("fetched health mismatch: %+v", fetchedHealth)
 	}
 
+	// Test ping while open
+	if err := repo.Ping(ctx); err != nil {
+		t.Fatalf("expected ping success on open repo, got: %v", err)
+	}
+
 	// 5. Test close
 	if err := repo.Close(); err != nil {
 		t.Fatalf("unexpected error closing repo: %v", err)
+	}
+
+	if err := repo.Ping(ctx); err == nil {
+		t.Fatal("expected error pinging closed repo, got nil")
 	}
 
 	if err := repo.SaveLatestTelemetry(ctx, "router-01", telem); err == nil {

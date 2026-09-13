@@ -26,6 +26,7 @@ type DeviceStateRepository interface {
 	SaveDeviceAnalysis(ctx context.Context, analysis model.DeviceAnalysis) error
 	GetDeviceAnalysis(ctx context.Context, deviceID string) (*model.DeviceAnalysis, error)
 
+	Ping(ctx context.Context) error
 	Close() error
 }
 
@@ -214,6 +215,19 @@ func (m *MemoryRepository) ListDevices(ctx context.Context) ([]string, error) {
 		devices = append(devices, id)
 	}
 	return devices, nil
+}
+
+// Ping checks if the in-memory repository is open and active.
+func (m *MemoryRepository) Ping(ctx context.Context) error {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.closed {
+		return errors.New("repository is closed")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return nil
 }
 
 // Close marks the in-memory repository closed.

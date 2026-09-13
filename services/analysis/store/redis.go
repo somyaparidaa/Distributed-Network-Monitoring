@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"distributed-network-monitor/services/analysis/model"
+
 	"github.com/redis/go-redis/v9"
 )
 
@@ -149,6 +150,11 @@ func (r *RedisRepository) ListDevices(ctx context.Context) ([]string, error) {
 		return nil, fmt.Errorf("list devices from redis: %w", err)
 	}
 	return members, nil
+}
+
+// Ping verifies connectivity to the Redis instance.
+func (r *RedisRepository) Ping(ctx context.Context) error {
+	return r.client.Ping(ctx).Err()
 }
 
 // Close closes the underlying Redis client connection.

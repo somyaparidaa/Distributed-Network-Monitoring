@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"sync"
 	"testing"
 	"time"
@@ -65,6 +66,9 @@ func TestConfigDefaultsAndOverrides(t *testing.T) {
 	if cfg.RedisKeyPrefix != "analysis" {
 		t.Fatalf("expected RedisKeyPrefix default 'analysis', got %q", cfg.RedisKeyPrefix)
 	}
+	if cfg.HTTPAddr != ":8082" {
+		t.Fatalf("expected HTTPAddr default ':8082', got %q", cfg.HTTPAddr)
+	}
 	if len(cfg.AggregationWindows) != 2 || cfg.AggregationWindows["1m"] != 1*time.Minute || cfg.AggregationWindows["5m"] != 5*time.Minute {
 		t.Fatalf("expected AggregationWindows [1m, 5m], got %v", cfg.AggregationWindows)
 	}
@@ -80,6 +84,7 @@ func TestConfigDefaultsAndOverrides(t *testing.T) {
 	t.Setenv("REDIS_DB", "2")
 	t.Setenv("REDIS_PASSWORD", "secret")
 	t.Setenv("REDIS_KEY_PREFIX", "custom_prefix")
+	t.Setenv("ANALYSIS_HTTP_ADDR", ":9095")
 	t.Setenv("AGGREGATION_WINDOWS", "30s,2m")
 
 	overridden := DefaultConfig()
@@ -109,6 +114,9 @@ func TestConfigDefaultsAndOverrides(t *testing.T) {
 	}
 	if overridden.RedisKeyPrefix != "custom_prefix" {
 		t.Fatalf("expected RedisKeyPrefix 'custom_prefix', got %q", overridden.RedisKeyPrefix)
+	}
+	if overridden.HTTPAddr != ":9095" {
+		t.Fatalf("expected HTTPAddr ':9095', got %q", overridden.HTTPAddr)
 	}
 	if len(overridden.AggregationWindows) != 2 || overridden.AggregationWindows["30s"] != 30*time.Second || overridden.AggregationWindows["2m"] != 2*time.Minute {
 		t.Fatalf("expected overridden AggregationWindows [30s, 2m], got %v", overridden.AggregationWindows)
@@ -323,6 +331,7 @@ func TestPipelineSurvivesRepositoryFailureWithoutCrashing(t *testing.T) {
 func TestServiceLifecycleAndGracefulShutdown(t *testing.T) {
 	for cycle := 0; cycle < 3; cycle++ {
 		cfg := DefaultConfig()
+		cfg.HTTPAddr = "127.0.0.1:0"
 		repo := store.NewMemoryRepository()
 		engine := aggregation.NewEngine(cfg.AggregationWindows)
 		detector := anomaly.NewDetector("1m")
@@ -389,6 +398,7 @@ func TestServiceLifecycleAndGracefulShutdown(t *testing.T) {
 func TestServiceLifecycleKafkaDisabled(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.KafkaEnabled = false
+	cfg.HTTPAddr = "127.0.0.1:0"
 
 	repo := store.NewMemoryRepository()
 	service, err := NewServiceWithDependencies(cfg, nil, nil, repo, nil, nil)
@@ -417,5 +427,40 @@ func TestServiceLifecycleKafkaDisabled(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("service did not stop within deadline")
+	}
+}
+
+func TestAnalysisAPIServerBindFailureReportsError(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen on dynamic port: %v", err)
+	}
+	defer ln.Close()
+
+	cfg := DefaultConfig()
+	cfg.KafkaEnabled = false
+	cfg.HTTPAddr = ln.Addr().String()
+
+	repo := store.NewMemoryRepository()
+	service, err := NewServiceWithDependencies(cfg, nil, nil, repo, nil, nil)
+	if err != nil {
+		t.Fatalf("failed to create service: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- service.Run(ctx)
+	}()
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("expected service.Run to report error on bind collision, got nil")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("service.Run timed out instead of returning bind error")
 	}
 }
