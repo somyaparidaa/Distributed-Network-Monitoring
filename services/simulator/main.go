@@ -373,6 +373,12 @@ func Run(ctx context.Context, addr string, fleet *Fleet) error {
 func main() {
 	addr := os.Getenv("SIMULATOR_ADDR")
 	if addr == "" {
+		addr = os.Getenv("SIMULATOR_HTTP_ADDR")
+	}
+	if addr == "" {
+		addr = os.Getenv("HTTP_ADDR")
+	}
+	if addr == "" {
 		addr = ":8080"
 	}
 

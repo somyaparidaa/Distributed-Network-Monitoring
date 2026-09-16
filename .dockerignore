@@ -1,0 +1,13 @@
+.git
+.github
+*.md
+*.log
+.DS_Store
+.idea
+.vscode
+docker
+deploy
+*.tmp
+bin
+*.test
+*.out

@@ -29,15 +29,15 @@ func writeError(w http.ResponseWriter, status int, message string) {
 
 // DeviceSummary represents the combined monitoring view for one device.
 type DeviceSummary struct {
-	DeviceID            string                `json:"device_id"`
-	MetricsURL          string                `json:"metrics_url"`
-	Status              polling.DeviceStatus  `json:"status"`
-	ConsecutiveFailures int                   `json:"consecutive_failures"`
-	LastError           string                `json:"last_error,omitempty"`
-	LastSuccess         *time.Time            `json:"last_success,omitempty"`
-	LastPolled          *time.Time            `json:"last_polled,omitempty"`
-	Health              *health.Assessment    `json:"health,omitempty"`
-	LatestTelemetry     *polling.Telemetry    `json:"latest_telemetry,omitempty"`
+	DeviceID            string               `json:"device_id"`
+	MetricsURL          string               `json:"metrics_url"`
+	Status              polling.DeviceStatus `json:"status"`
+	ConsecutiveFailures int                  `json:"consecutive_failures"`
+	LastError           string               `json:"last_error,omitempty"`
+	LastSuccess         *time.Time           `json:"last_success,omitempty"`
+	LastPolled          *time.Time           `json:"last_polled,omitempty"`
+	Health              *health.Assessment   `json:"health,omitempty"`
+	LatestTelemetry     *polling.Telemetry   `json:"latest_telemetry,omitempty"`
 }
 
 // ServiceHealth represents the operational health of the Monitoring Service itself.

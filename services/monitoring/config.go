@@ -33,7 +33,10 @@ type Config struct {
 
 // DefaultConfig returns the default fleet monitoring configuration targeting router-01, router-02, router-03.
 func DefaultConfig() Config {
-	baseSimulatorURL := os.Getenv("SIMULATOR_BASE_URL")
+	baseSimulatorURL := os.Getenv("SIMULATOR_URL")
+	if baseSimulatorURL == "" {
+		baseSimulatorURL = os.Getenv("SIMULATOR_BASE_URL")
+	}
 	if baseSimulatorURL == "" {
 		baseSimulatorURL = "http://localhost:8080"
 	}

@@ -9,13 +9,13 @@ import (
 
 // Explicit metric thresholds for health classification.
 const (
-	WarningCPU        = 70.0
-	CriticalCPU       = 85.0
-	WarningMemory     = 75.0
-	CriticalMemory    = 90.0
-	WarningLatencyMS  = 50
-	CriticalLatencyMS = 150
-	WarningPacketLoss = 1.0
+	WarningCPU         = 70.0
+	CriticalCPU        = 85.0
+	WarningMemory      = 75.0
+	CriticalMemory     = 90.0
+	WarningLatencyMS   = 50
+	CriticalLatencyMS  = 150
+	WarningPacketLoss  = 1.0
 	CriticalPacketLoss = 5.0
 )
 
