@@ -496,7 +496,13 @@ func TestHTTPHandlerEdgeCases(t *testing.T) {
 		expectedStatus int
 	}{
 		{
-			name:           "primary metrics rejects non-GET",
+			name:           "simulator health check returns 200",
+			method:         http.MethodGet,
+			path:           "/health",
+			expectedStatus: http.StatusOK,
+		},
+		{
+			name:           "primary device metrics rejects non-GET",
 			method:         http.MethodPost,
 			path:           "/metrics",
 			expectedStatus: http.StatusMethodNotAllowed,

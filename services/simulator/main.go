@@ -322,6 +322,11 @@ func NewMux(fleet *Fleet) (http.Handler, error) {
 	}
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"UP"}`))
+	})
 	mux.HandleFunc("/metrics", primaryDevice.metricsHandler)
 	mux.HandleFunc("/metrics/", fleet.metricsHandler)
 	mux.HandleFunc("/control/", fleet.controlHandler)
