@@ -2,6 +2,7 @@
 
 A distributed network monitoring and telemetry platform that simulates network devices, continuously collects telemetry, evaluates device health, streams events over Kafka, computes rolling-window metrics, detects anomalies, and exposes monitoring and analytical state through HTTP APIs.
 
+Project Plan and Epic link for reference: https://drive.google.com/drive/folders/14BYiTLfLot7dvSNFDnajGH5DEaWc-g5G?usp=sharing
 ## Architecture
 
 ```text
