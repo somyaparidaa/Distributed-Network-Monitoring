@@ -8,6 +8,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	"distributed-network-monitor/services/analysis/metrics"
 	"distributed-network-monitor/services/analysis/model"
 	"distributed-network-monitor/services/analysis/store"
 )
@@ -82,6 +85,7 @@ func NewHandler(
 func (h *Handler) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", h.handleHealth)
+	mux.Handle("/metrics", promhttp.HandlerFor(metrics.Registry, promhttp.HandlerOpts{}))
 	mux.HandleFunc("/devices", h.handleDevicesRoot)
 	mux.HandleFunc("/devices/", h.handleDevicesSubtree)
 	return mux
@@ -99,19 +103,24 @@ func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 	if h.kafkaEnabled {
 		dependencies["kafka"] = "ENABLED"
+		metrics.DependencyAvailable.WithLabelValues("kafka").Set(1)
 	} else {
 		dependencies["kafka"] = "DISABLED"
+		metrics.DependencyAvailable.WithLabelValues("kafka").Set(0)
 	}
 
 	if !h.redisEnabled {
 		dependencies["redis"] = "DISABLED"
+		metrics.DependencyAvailable.WithLabelValues("redis").Set(0)
 	} else {
 		ctx, cancel := context.WithTimeout(r.Context(), 500*time.Millisecond)
 		defer cancel()
 		if err := h.repo.Ping(ctx); err != nil {
 			dependencies["redis"] = "DISCONNECTED"
+			metrics.DependencyAvailable.WithLabelValues("redis").Set(0)
 		} else {
 			dependencies["redis"] = "CONNECTED"
+			metrics.DependencyAvailable.WithLabelValues("redis").Set(1)
 		}
 	}
 

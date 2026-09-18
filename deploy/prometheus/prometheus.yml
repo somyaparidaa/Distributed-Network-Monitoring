@@ -7,3 +7,18 @@ scrape_configs:
     static_configs:
       - targets: ["localhost:9090"]
 
+  - job_name: "simulator"
+    scrape_interval: 5s
+    static_configs:
+      - targets: ["simulator:8080"]
+
+  - job_name: "monitoring"
+    scrape_interval: 5s
+    static_configs:
+      - targets: ["monitoring:8081"]
+
+  - job_name: "analysis"
+    scrape_interval: 5s
+    static_configs:
+      - targets: ["analysis:8082"]
+

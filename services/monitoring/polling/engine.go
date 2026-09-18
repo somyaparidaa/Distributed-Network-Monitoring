@@ -2,11 +2,13 @@ package polling
 
 import (
 	"context"
+	"errors"
 	"log"
 	"sync"
 	"time"
 
 	"distributed-network-monitor/services/monitoring/device"
+	"distributed-network-monitor/services/monitoring/metrics"
 )
 
 // Poller defines the polling client capability.
@@ -110,13 +112,50 @@ func (e *Engine) pollWorker(ctx context.Context, dev device.MonitoredDevice) {
 	}
 }
 
+func classifyPollResult(err error) string {
+	if err == nil {
+		return "success"
+	}
+	if errors.Is(err, ErrDeviceUnavailable) {
+		return "unavailable"
+	}
+	if errors.Is(err, ErrDeviceUnreachable) {
+		return "unreachable"
+	}
+	return "error"
+}
+
+func (e *Engine) updateDeviceGauges() {
+	all := e.stateTracker.All()
+	upCount := 0.0
+	downCount := 0.0
+	for _, s := range all {
+		if s.Status == StatusDown {
+			downCount++
+		} else {
+			upCount++
+		}
+	}
+	metrics.DevicesMonitoredTotal.WithLabelValues("UP").Set(upCount)
+	metrics.DevicesMonitoredTotal.WithLabelValues("DOWN").Set(downCount)
+}
+
 func (e *Engine) pollOnce(ctx context.Context, dev device.MonitoredDevice) {
+	start := time.Now()
 	telemetry, err := ExecuteWithRetry(ctx, e.config.Retry, func() (Telemetry, error) {
-		return e.client.Poll(ctx, dev.MetricsURL)
+		attemptStart := time.Now()
+		t, pollErr := e.client.Poll(ctx, dev.MetricsURL)
+		attemptDuration := time.Since(attemptStart).Seconds()
+		result := classifyPollResult(pollErr)
+		metrics.PollAttemptsTotal.WithLabelValues(result).Inc()
+		metrics.PollDurationSeconds.WithLabelValues(result).Observe(attemptDuration)
+		return t, pollErr
 	})
+	_ = start
 
 	if err != nil {
 		state, transitioned := e.stateTracker.RecordFailure(dev.ID, err, e.config.FailureThreshold)
+		e.updateDeviceGauges()
 		if transitioned {
 			log.Printf("ALERT: device [%s] transitioned to DOWN after %d consecutive failures (last error: %v)",
 				dev.ID, state.ConsecutiveFailures, err)
@@ -135,6 +174,7 @@ func (e *Engine) pollOnce(ctx context.Context, dev device.MonitoredDevice) {
 
 	e.store.Set(dev.ID, telemetry)
 	_, recovered := e.stateTracker.RecordSuccess(dev.ID)
+	e.updateDeviceGauges()
 	if recovered {
 		log.Printf("RECOVERY: device [%s] recovered to UP", dev.ID)
 	}

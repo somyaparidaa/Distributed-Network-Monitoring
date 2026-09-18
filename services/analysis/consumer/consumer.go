@@ -7,6 +7,7 @@ import (
 	"log"
 	"sync"
 
+	"distributed-network-monitor/services/analysis/metrics"
 	"distributed-network-monitor/services/analysis/model"
 )
 
@@ -56,13 +57,16 @@ func (d *Dispatcher) ProcessMessage(ctx context.Context, msg Message) error {
 	case d.telemetryTopic:
 		var event model.TelemetryEvent
 		if err := json.Unmarshal(msg.Value, &event); err != nil {
+			metrics.KafkaEventsConsumedTotal.WithLabelValues(msg.Topic, "malformed_json").Inc()
 			log.Printf("[ANALYSIS] warning: discarding malformed telemetry event on topic %q: %v | payload: %s", msg.Topic, err, string(msg.Value))
 			return nil
 		}
 		if err := event.Validate(); err != nil {
+			metrics.KafkaEventsConsumedTotal.WithLabelValues(msg.Topic, "invalid_schema").Inc()
 			log.Printf("[ANALYSIS] warning: discarding invalid telemetry event: %v | payload: %s", err, string(msg.Value))
 			return nil
 		}
+		metrics.KafkaEventsConsumedTotal.WithLabelValues(msg.Topic, "valid").Inc()
 		if err := d.handler.HandleTelemetry(ctx, event); err != nil {
 			log.Printf("[ANALYSIS] error handling telemetry event [%s] for device [%s]: %v", event.EventID, event.DeviceID, err)
 			return err
@@ -72,13 +76,16 @@ func (d *Dispatcher) ProcessMessage(ctx context.Context, msg Message) error {
 	case d.healthTopic:
 		var event model.HealthEvent
 		if err := json.Unmarshal(msg.Value, &event); err != nil {
+			metrics.KafkaEventsConsumedTotal.WithLabelValues(msg.Topic, "malformed_json").Inc()
 			log.Printf("[ANALYSIS] warning: discarding malformed health event on topic %q: %v | payload: %s", msg.Topic, err, string(msg.Value))
 			return nil
 		}
 		if err := event.Validate(); err != nil {
+			metrics.KafkaEventsConsumedTotal.WithLabelValues(msg.Topic, "invalid_schema").Inc()
 			log.Printf("[ANALYSIS] warning: discarding invalid health event: %v | payload: %s", err, string(msg.Value))
 			return nil
 		}
+		metrics.KafkaEventsConsumedTotal.WithLabelValues(msg.Topic, "valid").Inc()
 		if err := d.handler.HandleHealth(ctx, event); err != nil {
 			log.Printf("[ANALYSIS] error handling health event [%s] for device [%s]: %v", event.EventID, event.DeviceID, err)
 			return err

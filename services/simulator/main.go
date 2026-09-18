@@ -14,6 +14,9 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 const (
@@ -267,6 +270,100 @@ func (f *Fleet) metricsHandler(w http.ResponseWriter, r *http.Request) {
 	device.metricsHandler(w, r)
 }
 
+var (
+	simReg = prometheus.NewRegistry()
+
+	simHTTPRequestsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "simulator_http_requests_total",
+			Help: "Total number of HTTP requests processed by the simulator.",
+		},
+		[]string{"endpoint", "method", "status"},
+	)
+
+	simHTTPRequestDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "simulator_http_request_duration_seconds",
+			Help:    "Duration of HTTP requests processed by the simulator in seconds.",
+			Buckets: prometheus.DefBuckets,
+		},
+		[]string{"endpoint"},
+	)
+
+	simDevicesTotal = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "simulator_devices_total",
+			Help: "Current count of simulated devices by operating condition.",
+		},
+		[]string{"condition"},
+	)
+
+	simFailureInjectionsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "simulator_failure_injections_total",
+			Help: "Total number of failure injection actions performed.",
+		},
+		[]string{"action"},
+	)
+)
+
+func init() {
+	simReg.MustRegister(
+		simHTTPRequestsTotal,
+		simHTTPRequestDuration,
+		simDevicesTotal,
+		simFailureInjectionsTotal,
+	)
+}
+
+type statusLoggingResponseWriter struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (w *statusLoggingResponseWriter) WriteHeader(code int) {
+	w.statusCode = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func normalizeSimulatorEndpoint(path string) string {
+	if path == "/health" {
+		return "/health"
+	}
+	if path == "/metrics" {
+		return "/metrics"
+	}
+	if strings.HasPrefix(path, "/metrics/") {
+		return "/metrics/{deviceID}"
+	}
+	if strings.HasPrefix(path, "/control/") {
+		return "/control/{deviceID}/{action}"
+	}
+	return "other"
+}
+
+func updateFleetConditionGauges(f *Fleet) {
+	normalCount := 0.0
+	degradedCount := 0.0
+	downCount := 0.0
+
+	for _, d := range f.devices {
+		t := d.currentTelemetry()
+		switch t.Condition {
+		case ConditionNormal:
+			normalCount++
+		case ConditionDegraded:
+			degradedCount++
+		case ConditionDown:
+			downCount++
+		}
+	}
+
+	simDevicesTotal.WithLabelValues("NORMAL").Set(normalCount)
+	simDevicesTotal.WithLabelValues("DEGRADED").Set(degradedCount)
+	simDevicesTotal.WithLabelValues("DOWN").Set(downCount)
+}
+
 func (f *Fleet) controlHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
@@ -290,8 +387,12 @@ func (f *Fleet) controlHandler(w http.ResponseWriter, r *http.Request) {
 	switch parts[1] {
 	case "down":
 		device.SetDown(true)
+		simFailureInjectionsTotal.WithLabelValues("down").Inc()
+		updateFleetConditionGauges(f)
 	case "recover":
 		device.SetDown(false)
+		simFailureInjectionsTotal.WithLabelValues("recover").Inc()
+		updateFleetConditionGauges(f)
 	default:
 		http.NotFound(w, r)
 		return
@@ -316,10 +417,12 @@ func clamp(value, min, max float64) float64 {
 
 // NewMux constructs an http.Handler with all metrics and control routes for the fleet.
 func NewMux(fleet *Fleet) (http.Handler, error) {
-	primaryDevice, exists := fleet.Device("router-01")
+	_, exists := fleet.Device("router-01")
 	if !exists {
 		return nil, fmt.Errorf("primary device router-01 not found in fleet")
 	}
+
+	updateFleetConditionGauges(fleet)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -327,10 +430,35 @@ func NewMux(fleet *Fleet) (http.Handler, error) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"status":"UP"}`))
 	})
-	mux.HandleFunc("/metrics", primaryDevice.metricsHandler)
+	promHandler := promhttp.HandlerFor(simReg, promhttp.HandlerOpts{})
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/metrics" {
+			if r.Method != http.MethodGet {
+				w.Header().Set("Allow", http.MethodGet)
+				w.WriteHeader(http.StatusMethodNotAllowed)
+				return
+			}
+			updateFleetConditionGauges(fleet)
+			promHandler.ServeHTTP(w, r)
+			return
+		}
+		fleet.metricsHandler(w, r)
+	})
 	mux.HandleFunc("/metrics/", fleet.metricsHandler)
 	mux.HandleFunc("/control/", fleet.controlHandler)
-	return mux, nil
+
+	wrapped := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		sw := &statusLoggingResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+		mux.ServeHTTP(sw, r)
+		duration := time.Since(start).Seconds()
+
+		normPath := normalizeSimulatorEndpoint(r.URL.Path)
+		simHTTPRequestsTotal.WithLabelValues(normPath, r.Method, fmt.Sprintf("%d", sw.statusCode)).Inc()
+		simHTTPRequestDuration.WithLabelValues(normPath).Observe(duration)
+	})
+
+	return wrapped, nil
 }
 
 // Run starts the fleet simulation and HTTP server, shutting down gracefully on ctx cancellation.

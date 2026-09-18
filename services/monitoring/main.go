@@ -14,6 +14,7 @@ import (
 	"distributed-network-monitor/services/monitoring/device"
 	"distributed-network-monitor/services/monitoring/health"
 	"distributed-network-monitor/services/monitoring/kafka"
+	"distributed-network-monitor/services/monitoring/metrics"
 	"distributed-network-monitor/services/monitoring/polling"
 )
 
@@ -68,6 +69,9 @@ func NewServiceWithProducer(cfg Config, injectedProducer kafka.Producer) (*Servi
 		}
 		publisher := kafka.NewEventPublisher(producer)
 		evaluator.SetTransitionListener(publisher)
+		metrics.KafkaAvailable.Set(1)
+	} else {
+		metrics.KafkaAvailable.Set(0)
 	}
 
 	stateTracker := polling.NewStateTracker()

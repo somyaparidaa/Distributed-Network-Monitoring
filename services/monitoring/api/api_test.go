@@ -5,11 +5,13 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"distributed-network-monitor/services/monitoring/device"
 	"distributed-network-monitor/services/monitoring/health"
+	"distributed-network-monitor/services/monitoring/metrics"
 	"distributed-network-monitor/services/monitoring/polling"
 )
 
@@ -70,6 +72,30 @@ func TestHealthEndpoint(t *testing.T) {
 	}
 	if ct := postResp.Header.Get("Content-Type"); ct != "application/json" {
 		t.Fatalf("Content-Type = %q, want application/json", ct)
+	}
+}
+
+func TestMonitoringMetricsEndpoint(t *testing.T) {
+	h, _, _, _, _ := setupTestAPI(t)
+	mux := h.Routes()
+
+	// Simulate increments so the labeled vector metrics are initialized and rendered
+	metrics.PollAttemptsTotal.WithLabelValues("success").Inc()
+	metrics.HealthEvaluationsTotal.WithLabelValues("HEALTHY").Inc()
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 from /metrics, got %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "monitoring_poll_attempts_total") {
+		t.Errorf("expected body to contain 'monitoring_poll_attempts_total', got:\n%s", body)
+	}
+	if !strings.Contains(body, "monitoring_health_evaluations_total") {
+		t.Errorf("expected body to contain 'monitoring_health_evaluations_total', got:\n%s", body)
 	}
 }
 

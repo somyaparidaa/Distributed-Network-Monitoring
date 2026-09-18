@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -90,6 +91,27 @@ func TestHealthEndpoint(t *testing.T) {
 	}
 	if recPost.Header().Get("Allow") != http.MethodGet {
 		t.Fatalf("expected Allow: GET header, got %q", recPost.Header().Get("Allow"))
+	}
+}
+
+func TestAnalysisMetricsEndpoint(t *testing.T) {
+	handler, _ := setupTestHandler()
+
+	// Trigger a health check so dependency gauges are set
+	healthReq := httptest.NewRequest(http.MethodGet, "/health", nil)
+	healthRec := httptest.NewRecorder()
+	handler.Routes().ServeHTTP(healthRec, healthReq)
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rec := httptest.NewRecorder()
+	handler.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 from /metrics, got %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "analysis_dependency_available") {
+		t.Errorf("expected body to contain 'analysis_dependency_available', got:\n%s", body)
 	}
 }
 

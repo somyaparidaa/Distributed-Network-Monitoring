@@ -6,8 +6,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
 	"distributed-network-monitor/services/monitoring/device"
 	"distributed-network-monitor/services/monitoring/health"
+	"distributed-network-monitor/services/monitoring/metrics"
 	"distributed-network-monitor/services/monitoring/polling"
 )
 
@@ -77,6 +80,7 @@ func NewHandler(
 func (h *Handler) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", h.handleServiceHealth)
+	mux.Handle("/metrics", promhttp.HandlerFor(metrics.Registry, promhttp.HandlerOpts{}))
 	mux.HandleFunc("/devices", h.handleDevicesRoot)
 	mux.HandleFunc("/devices/", h.handleDevicesSubtree)
 	return mux

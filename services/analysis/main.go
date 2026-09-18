@@ -16,6 +16,7 @@ import (
 	"distributed-network-monitor/services/analysis/anomaly"
 	"distributed-network-monitor/services/analysis/api"
 	"distributed-network-monitor/services/analysis/consumer"
+	"distributed-network-monitor/services/analysis/metrics"
 	"distributed-network-monitor/services/analysis/model"
 	"distributed-network-monitor/services/analysis/store"
 )
@@ -69,31 +70,54 @@ func (p *Pipeline) Detector() *anomaly.Detector {
 // HandleTelemetry projects decoded telemetry events into storage, computes rolling window statistics,
 // evaluates anomaly rules, and persists device analysis.
 // Redis/storage errors are logged as warnings and do NOT terminate consumption.
+// HandleTelemetry projects decoded telemetry events into storage, computes rolling window statistics,
+// evaluates anomaly rules, and persists device analysis.
+// Redis/storage errors are logged as warnings and do NOT terminate consumption.
 func (p *Pipeline) HandleTelemetry(ctx context.Context, event model.TelemetryEvent) error {
+	start := time.Now()
+	defer func() {
+		metrics.ProcessingDurationSeconds.WithLabelValues("telemetry").Observe(time.Since(start).Seconds())
+	}()
+
 	log.Printf("[ANALYSIS] received telemetry event [%s] from device [%s] (CPU: %.1f%%, Latency: %dms, Loss: %.2f%%)",
 		event.EventID, event.DeviceID, event.CPU, event.LatencyMS, event.PacketLoss)
 
 	// 1. Persist latest point-in-time telemetry
 	if err := p.repo.SaveLatestTelemetry(ctx, event.DeviceID, event); err != nil {
+		metrics.StorageOperationsTotal.WithLabelValues("save_telemetry", "error").Inc()
+		metrics.ProcessingErrorsTotal.WithLabelValues("telemetry", "save_telemetry").Inc()
 		log.Printf("[ANALYSIS] warning: failed to project latest telemetry for device [%s] to repository: %v", event.DeviceID, err)
+	} else {
+		metrics.StorageOperationsTotal.WithLabelValues("save_telemetry", "success").Inc()
 	}
 
 	// 2. Compute in-memory rolling metrics across configured windows
-	metrics := p.engine.AddSample(event)
+	rollingMetrics := p.engine.AddSample(event)
 
 	// 3. Persist latest derived aggregate per window in Redis/Repository
-	for _, m := range metrics {
+	for _, m := range rollingMetrics {
 		if err := p.repo.SaveRollingMetrics(ctx, m); err != nil {
+			metrics.StorageOperationsTotal.WithLabelValues("save_rolling", "error").Inc()
+			metrics.ProcessingErrorsTotal.WithLabelValues("telemetry", "save_rolling").Inc()
 			log.Printf("[ANALYSIS] warning: failed to save rolling metrics [%s] for device [%s] to repository: %v", m.Window, m.DeviceID, err)
+		} else {
+			metrics.StorageOperationsTotal.WithLabelValues("save_rolling", "success").Inc()
 		}
 	}
 
 	// 4. Evaluate rolling metrics with AnomalyDetector
-	analysis := p.detector.EvaluateMetrics(event.DeviceID, metrics)
+	analysis := p.detector.EvaluateMetrics(event.DeviceID, rollingMetrics)
+	for _, a := range analysis.ActiveAnomalies {
+		metrics.AnomaliesDetectedTotal.WithLabelValues(a.Signal, string(a.Severity)).Inc()
+	}
 
 	// 5. Persist latest DeviceAnalysis
 	if err := p.repo.SaveDeviceAnalysis(ctx, analysis); err != nil {
+		metrics.StorageOperationsTotal.WithLabelValues("save_analysis", "error").Inc()
+		metrics.ProcessingErrorsTotal.WithLabelValues("telemetry", "save_analysis").Inc()
 		log.Printf("[ANALYSIS] warning: failed to save device analysis for device [%s] to repository: %v", event.DeviceID, err)
+	} else {
+		metrics.StorageOperationsTotal.WithLabelValues("save_analysis", "success").Inc()
 	}
 
 	return nil
@@ -103,20 +127,36 @@ func (p *Pipeline) HandleTelemetry(ctx context.Context, event model.TelemetryEve
 // and updates device analysis.
 // Redis/storage errors are logged as warnings and do NOT terminate consumption.
 func (p *Pipeline) HandleHealth(ctx context.Context, event model.HealthEvent) error {
+	start := time.Now()
+	defer func() {
+		metrics.ProcessingDurationSeconds.WithLabelValues("health").Observe(time.Since(start).Seconds())
+	}()
+
 	log.Printf("[ANALYSIS] received health transition event [%s] for device [%s]: %s -> %s (score: %d)",
 		event.EventID, event.DeviceID, event.PreviousStatus, event.CurrentStatus, event.Score)
 
 	// 1. Persist latest health assessment
 	if err := p.repo.SaveLatestHealth(ctx, event.DeviceID, event); err != nil {
+		metrics.StorageOperationsTotal.WithLabelValues("save_health", "error").Inc()
+		metrics.ProcessingErrorsTotal.WithLabelValues("health", "save_health").Inc()
 		log.Printf("[ANALYSIS] warning: failed to project latest health for device [%s] to repository: %v", event.DeviceID, err)
+	} else {
+		metrics.StorageOperationsTotal.WithLabelValues("save_health", "success").Inc()
 	}
 
 	// 2. Evaluate health anomaly
 	analysis := p.detector.EvaluateHealth(event)
+	for _, a := range analysis.ActiveAnomalies {
+		metrics.AnomaliesDetectedTotal.WithLabelValues(a.Signal, string(a.Severity)).Inc()
+	}
 
 	// 3. Persist updated DeviceAnalysis
 	if err := p.repo.SaveDeviceAnalysis(ctx, analysis); err != nil {
+		metrics.StorageOperationsTotal.WithLabelValues("save_analysis", "error").Inc()
+		metrics.ProcessingErrorsTotal.WithLabelValues("health", "save_analysis").Inc()
 		log.Printf("[ANALYSIS] warning: failed to save device analysis on health event for device [%s] to repository: %v", event.DeviceID, err)
+	} else {
+		metrics.StorageOperationsTotal.WithLabelValues("save_analysis", "success").Inc()
 	}
 
 	return nil

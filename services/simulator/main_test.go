@@ -6,6 +6,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -502,7 +503,13 @@ func TestHTTPHandlerEdgeCases(t *testing.T) {
 			expectedStatus: http.StatusOK,
 		},
 		{
-			name:           "primary device metrics rejects non-GET",
+			name:           "prometheus metrics endpoint returns 200 on GET",
+			method:         http.MethodGet,
+			path:           "/metrics",
+			expectedStatus: http.StatusOK,
+		},
+		{
+			name:           "prometheus metrics endpoint rejects non-GET",
 			method:         http.MethodPost,
 			path:           "/metrics",
 			expectedStatus: http.StatusMethodNotAllowed,
@@ -617,6 +624,69 @@ func TestRunServerGracefulShutdown(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("Run timed out waiting for graceful shutdown")
+	}
+}
+
+func TestPrometheusMetricsExposition(t *testing.T) {
+	fleet := newTestFleet(t)
+	handler, err := NewMux(fleet)
+	if err != nil {
+		t.Fatalf("NewMux failed: %v", err)
+	}
+
+	// Make a request to generate metrics
+	req := httptest.NewRequest(http.MethodGet, "/metrics/router-01", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 from router-01 telemetry, got %d", rec.Code)
+	}
+
+	// Now scrape /metrics (Prometheus)
+	metricsReq := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	metricsRec := httptest.NewRecorder()
+	handler.ServeHTTP(metricsRec, metricsReq)
+
+	if metricsRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 from /metrics, got %d", metricsRec.Code)
+	}
+	body := metricsRec.Body.String()
+	if !strings.Contains(body, "simulator_devices_total") {
+		t.Errorf("expected body to contain 'simulator_devices_total', got:\n%s", body)
+	}
+	if !strings.Contains(body, "simulator_http_requests_total") {
+		t.Errorf("expected body to contain 'simulator_http_requests_total', got:\n%s", body)
+	}
+	if !strings.Contains(body, `endpoint="/metrics/{deviceID}"`) {
+		t.Errorf("expected normalized endpoint label in metrics, got:\n%s", body)
+	}
+}
+
+func TestRouterTelemetryRoutesPreserved(t *testing.T) {
+	fleet := newTestFleet(t)
+	handler, err := NewMux(fleet)
+	if err != nil {
+		t.Fatalf("NewMux failed: %v", err)
+	}
+
+	for _, id := range []string{"router-01", "router-02", "router-03"} {
+		req := httptest.NewRequest(http.MethodGet, "/metrics/"+id, nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("device %s returned status %d, want 200", id, rec.Code)
+		}
+		if contentType := rec.Header().Get("Content-Type"); contentType != "application/json" {
+			t.Fatalf("device %s returned Content-Type %q, want application/json", id, contentType)
+		}
+		var telem Telemetry
+		if err := json.NewDecoder(rec.Body).Decode(&telem); err != nil {
+			t.Fatalf("failed to decode telemetry JSON for %s: %v", id, err)
+		}
+		if telem.DeviceID != id {
+			t.Fatalf("expected device_id %s, got %s", id, telem.DeviceID)
+		}
 	}
 }
 
