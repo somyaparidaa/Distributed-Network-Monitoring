@@ -190,9 +190,6 @@ docker compose down -v
 ---
 
 ## 7. Demo Workflow (Step-by-Step)
-
-Follow the complete [Interview Demo Script](docs/demo.md) for a guided 5–10 minute demonstration.
-
 ### Quick Verification Run
 ```bash
 # 1. Verify fleet health in monitoring service
@@ -239,8 +236,6 @@ Access the **Network Telemetry & Fleet Overview** dashboard at `http://localhost
 - **Poll Latency**: p95 and p99 percentile latency graphs.
 - **Event Streaming**: Kafka publish rates and anomaly detection rates over time.
 - **Dependency Health**: Instantaneous health gauges for Kafka and Redis.
-
-Detailed screenshot reproduction steps are documented in [docs/screenshots/README.md](docs/screenshots/README.md).
 
 ---
 
@@ -347,8 +342,6 @@ go vet ./...
 ---
 
 ## 14. Design Tradeoffs & Alternatives Considered
-
-See the comprehensive [Interview Defense Guide](docs/interview-defense.md) for detailed analysis of design decisions:
 - **Kafka vs. RabbitMQ / Redis PubSub**: Selected Kafka for partition-keyed ordering per device, horizontal consumer group rebalancing, and persistent event logs.
 - **In-Memory Sliding Window vs. Redis ZSET**: Selected in-memory circular buffers to eliminate network latency bottlenecks during high-frequency telemetry calculations.
 - **Deterministic Rules vs. Machine Learning**: Selected threshold heuristics with sample dampening for transparent, auditable, sub-millisecond alerting without cold-start model drift.
@@ -402,7 +395,5 @@ See the comprehensive [Interview Defense Guide](docs/interview-defense.md) for d
 ---
 
 ## 18. Engineering Documentation Links
-
-- [Interview Demo Script](docs/demo.md)
-- [Technical Interview Defense Guide](docs/interview-defense.md)
-- [Screenshot Reproduction Guide](docs/screenshots/README.md)
+- DOCUMENTATION: https://drive.google.com/file/d/1Eps1VQuM3WQ5aRA8JbW9MVv8lwTRr_9B/view?usp=sharing
+- EPIC REFERENCE AND PLAN: https://drive.google.com/drive/folders/14BYiTLfLot7dvSNFDnajGH5DEaWc-g5G?usp=sharing
