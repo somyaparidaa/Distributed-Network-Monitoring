@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -35,7 +36,7 @@ func writeError(w http.ResponseWriter, status int, message string) {
 type ServiceHealth struct {
 	Status       string            `json:"status"`
 	Uptime       string            `json:"uptime"`
-	Dependencies map[string]string `json:"dependencies"`
+	Dependencies map[string]string `json:"dependencies,omitempty"`
 	Timestamp    time.Time         `json:"timestamp"`
 }
 
@@ -52,6 +53,7 @@ type DeviceView struct {
 type Handler struct {
 	repo              store.DeviceStateRepository
 	kafkaEnabled      bool
+	kafkaBrokers      []string
 	redisEnabled      bool
 	configuredWindows []string
 	startTime         time.Time
@@ -61,6 +63,17 @@ type Handler struct {
 func NewHandler(
 	repo store.DeviceStateRepository,
 	kafkaEnabled bool,
+	redisEnabled bool,
+	aggregationWindows map[string]time.Duration,
+) *Handler {
+	return NewHandlerWithBrokers(repo, kafkaEnabled, nil, redisEnabled, aggregationWindows)
+}
+
+// NewHandlerWithBrokers constructs an analysis API handler with kafka broker addresses for readiness probing.
+func NewHandlerWithBrokers(
+	repo store.DeviceStateRepository,
+	kafkaEnabled bool,
+	kafkaBrokers []string,
 	redisEnabled bool,
 	aggregationWindows map[string]time.Duration,
 ) *Handler {
@@ -75,6 +88,7 @@ func NewHandler(
 	return &Handler{
 		repo:              repo,
 		kafkaEnabled:      kafkaEnabled,
+		kafkaBrokers:      kafkaBrokers,
 		redisEnabled:      redisEnabled,
 		configuredWindows: windows,
 		startTime:         time.Now().UTC(),
@@ -85,13 +99,15 @@ func NewHandler(
 func (h *Handler) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", h.handleHealth)
+	mux.HandleFunc("/health/live", h.handleLive)
+	mux.HandleFunc("/health/ready", h.handleReady)
 	mux.Handle("/metrics", promhttp.HandlerFor(metrics.Registry, promhttp.HandlerOpts{}))
 	mux.HandleFunc("/devices", h.handleDevicesRoot)
 	mux.HandleFunc("/devices/", h.handleDevicesSubtree)
 	return mux
 }
 
-// handleHealth serves GET /health.
+// handleHealth serves GET /health (legacy compatibility).
 func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.Header().Set("Allow", http.MethodGet)
@@ -99,11 +115,90 @@ func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	dependencies := h.checkDependencies(r.Context())
+	uptime := time.Since(h.startTime).Truncate(time.Second).String()
+	writeJSON(w, http.StatusOK, ServiceHealth{
+		Status:       "UP",
+		Uptime:       uptime,
+		Dependencies: dependencies,
+		Timestamp:    time.Now().UTC(),
+	})
+}
+
+// handleLive serves GET /health/live (Liveness probe - never fails on external dependencies).
+func (h *Handler) handleLive(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	uptime := time.Since(h.startTime).Truncate(time.Second).String()
+	writeJSON(w, http.StatusOK, ServiceHealth{
+		Status:    "UP",
+		Uptime:    uptime,
+		Timestamp: time.Now().UTC(),
+	})
+}
+
+// handleReady serves GET /health/ready (Readiness probe - fails 503 if Redis or Kafka down).
+func (h *Handler) handleReady(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	dependencies := h.checkDependencies(r.Context())
+	ready := true
+	if h.redisEnabled && dependencies["redis"] != "CONNECTED" {
+		ready = false
+	}
+	if h.kafkaEnabled && dependencies["kafka"] != "CONNECTED" && dependencies["kafka"] != "ENABLED" {
+		ready = false
+	}
+
+	uptime := time.Since(h.startTime).Truncate(time.Second).String()
+	statusStr := "READY"
+	httpStatus := http.StatusOK
+	if !ready {
+		statusStr = "NOT_READY"
+		httpStatus = http.StatusServiceUnavailable
+	}
+
+	writeJSON(w, httpStatus, ServiceHealth{
+		Status:       statusStr,
+		Uptime:       uptime,
+		Dependencies: dependencies,
+		Timestamp:    time.Now().UTC(),
+	})
+}
+
+func (h *Handler) checkDependencies(ctx context.Context) map[string]string {
 	dependencies := make(map[string]string)
 
 	if h.kafkaEnabled {
-		dependencies["kafka"] = "ENABLED"
-		metrics.DependencyAvailable.WithLabelValues("kafka").Set(1)
+		if len(h.kafkaBrokers) > 0 {
+			kafkaAvailable := false
+			for _, broker := range h.kafkaBrokers {
+				conn, err := net.DialTimeout("tcp", broker, 500*time.Millisecond)
+				if err == nil {
+					_ = conn.Close()
+					kafkaAvailable = true
+					break
+				}
+			}
+			if kafkaAvailable {
+				dependencies["kafka"] = "CONNECTED"
+				metrics.DependencyAvailable.WithLabelValues("kafka").Set(1)
+			} else {
+				dependencies["kafka"] = "DISCONNECTED"
+				metrics.DependencyAvailable.WithLabelValues("kafka").Set(0)
+			}
+		} else {
+			dependencies["kafka"] = "ENABLED"
+			metrics.DependencyAvailable.WithLabelValues("kafka").Set(1)
+		}
 	} else {
 		dependencies["kafka"] = "DISABLED"
 		metrics.DependencyAvailable.WithLabelValues("kafka").Set(0)
@@ -113,9 +208,9 @@ func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {
 		dependencies["redis"] = "DISABLED"
 		metrics.DependencyAvailable.WithLabelValues("redis").Set(0)
 	} else {
-		ctx, cancel := context.WithTimeout(r.Context(), 500*time.Millisecond)
+		pingCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 		defer cancel()
-		if err := h.repo.Ping(ctx); err != nil {
+		if err := h.repo.Ping(pingCtx); err != nil {
 			dependencies["redis"] = "DISCONNECTED"
 			metrics.DependencyAvailable.WithLabelValues("redis").Set(0)
 		} else {
@@ -124,13 +219,7 @@ func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	uptime := time.Since(h.startTime).Truncate(time.Second).String()
-	writeJSON(w, http.StatusOK, ServiceHealth{
-		Status:       "UP",
-		Uptime:       uptime,
-		Dependencies: dependencies,
-		Timestamp:    time.Now().UTC(),
-	})
+	return dependencies
 }
 
 // handleDevicesRoot serves GET /devices.

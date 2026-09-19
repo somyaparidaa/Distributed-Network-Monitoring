@@ -251,7 +251,7 @@ func NewServiceWithDependencies(
 		}
 	}
 
-	apiHandler := api.NewHandler(repo, cfg.KafkaEnabled, cfg.RedisEnabled, cfg.AggregationWindows)
+	apiHandler := api.NewHandlerWithBrokers(repo, cfg.KafkaEnabled, cfg.KafkaBrokers, cfg.RedisEnabled, cfg.AggregationWindows)
 
 	return &Service{
 		cfg:        cfg,

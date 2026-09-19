@@ -75,6 +75,77 @@ func TestHealthEndpoint(t *testing.T) {
 	}
 }
 
+func TestMonitoringLiveAndReadinessEndpoints(t *testing.T) {
+	h, reg, store, healthStore, tracker := setupTestAPI(t)
+	server := httptest.NewServer(h.Routes())
+	defer server.Close()
+
+	// 1. GET /health/live returns 200 UP
+	respLive, err := http.Get(server.URL + "/health/live")
+	if err != nil {
+		t.Fatalf("GET /health/live failed: %v", err)
+	}
+	defer respLive.Body.Close()
+	if respLive.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", respLive.StatusCode)
+	}
+	var sh ServiceHealth
+	if err := json.NewDecoder(respLive.Body).Decode(&sh); err != nil {
+		t.Fatalf("decode live failed: %v", err)
+	}
+	if sh.Status != "UP" {
+		t.Fatalf("live status = %s, want UP", sh.Status)
+	}
+
+	// 2. GET /health/ready with kafka disabled returns 200 READY
+	respReady, err := http.Get(server.URL + "/health/ready")
+	if err != nil {
+		t.Fatalf("GET /health/ready failed: %v", err)
+	}
+	defer respReady.Body.Close()
+	if respReady.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", respReady.StatusCode)
+	}
+	var rh ReadinessHealth
+	if err := json.NewDecoder(respReady.Body).Decode(&rh); err != nil {
+		t.Fatalf("decode ready failed: %v", err)
+	}
+	if rh.Status != "READY" || rh.Dependencies["kafka"] != "DISABLED" {
+		t.Fatalf("unexpected ready response: %+v", rh)
+	}
+
+	// 3. GET /health/ready with Kafka enabled and unreachable broker returns 503 NOT_READY
+	hWithKafka := NewHandlerWithDependencies(reg, store, healthStore, tracker, nil, true, []string{"127.0.0.1:54321"})
+	serverKafka := httptest.NewServer(hWithKafka.Routes())
+	defer serverKafka.Close()
+
+	respDown, err := http.Get(serverKafka.URL + "/health/ready")
+	if err != nil {
+		t.Fatalf("GET /health/ready with bad kafka failed: %v", err)
+	}
+	defer respDown.Body.Close()
+	if respDown.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", respDown.StatusCode)
+	}
+	var rhDown ReadinessHealth
+	if err := json.NewDecoder(respDown.Body).Decode(&rhDown); err != nil {
+		t.Fatalf("decode ready down failed: %v", err)
+	}
+	if rhDown.Status != "NOT_READY" || rhDown.Dependencies["kafka"] != "DISCONNECTED" {
+		t.Fatalf("unexpected ready down response: %+v", rhDown)
+	}
+
+	// 4. Liveness still returns 200 UP even when Kafka is down
+	respLiveEvenDown, err := http.Get(serverKafka.URL + "/health/live")
+	if err != nil {
+		t.Fatalf("GET /health/live failed: %v", err)
+	}
+	defer respLiveEvenDown.Body.Close()
+	if respLiveEvenDown.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", respLiveEvenDown.StatusCode)
+	}
+}
+
 func TestMonitoringMetricsEndpoint(t *testing.T) {
 	h, _, _, _, _ := setupTestAPI(t)
 	mux := h.Routes()

@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -51,12 +52,24 @@ type ServiceHealth struct {
 	Timestamp        time.Time `json:"timestamp"`
 }
 
+// ReadinessHealth represents the operational readiness and external dependency status of the Monitoring Service.
+type ReadinessHealth struct {
+	Status           string            `json:"status"`
+	Uptime           string            `json:"uptime"`
+	MonitoredDevices int               `json:"monitored_devices"`
+	Dependencies     map[string]string `json:"dependencies"`
+	Timestamp        time.Time         `json:"timestamp"`
+}
+
 // Handler manages HTTP endpoints for the Monitoring Service read API.
 type Handler struct {
 	registry     *device.Registry
 	store        *polling.Store
 	healthStore  *health.Store
 	stateTracker *polling.StateTracker
+	client       polling.Poller
+	kafkaEnabled bool
+	kafkaBrokers []string
 	startTime    time.Time
 }
 
@@ -67,11 +80,27 @@ func NewHandler(
 	healthStore *health.Store,
 	stateTracker *polling.StateTracker,
 ) *Handler {
+	return NewHandlerWithDependencies(registry, store, healthStore, stateTracker, nil, false, nil)
+}
+
+// NewHandlerWithDependencies constructs an API Handler with dependency checking capabilities.
+func NewHandlerWithDependencies(
+	registry *device.Registry,
+	store *polling.Store,
+	healthStore *health.Store,
+	stateTracker *polling.StateTracker,
+	client polling.Poller,
+	kafkaEnabled bool,
+	kafkaBrokers []string,
+) *Handler {
 	return &Handler{
 		registry:     registry,
 		store:        store,
 		healthStore:  healthStore,
 		stateTracker: stateTracker,
+		client:       client,
+		kafkaEnabled: kafkaEnabled,
+		kafkaBrokers: kafkaBrokers,
 		startTime:    time.Now().UTC(),
 	}
 }
@@ -80,13 +109,15 @@ func NewHandler(
 func (h *Handler) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", h.handleServiceHealth)
+	mux.HandleFunc("/health/live", h.handleServiceHealth)
+	mux.HandleFunc("/health/ready", h.handleReadiness)
 	mux.Handle("/metrics", promhttp.HandlerFor(metrics.Registry, promhttp.HandlerOpts{}))
 	mux.HandleFunc("/devices", h.handleDevicesRoot)
 	mux.HandleFunc("/devices/", h.handleDevicesSubtree)
 	return mux
 }
 
-// handleServiceHealth returns the Monitoring Service's own operational health (not fleet health).
+// handleServiceHealth returns the Monitoring Service's liveness (not fleet health and not external dependencies).
 func (h *Handler) handleServiceHealth(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.Header().Set("Allow", http.MethodGet)
@@ -99,6 +130,65 @@ func (h *Handler) handleServiceHealth(w http.ResponseWriter, r *http.Request) {
 		Status:           "UP",
 		Uptime:           uptime,
 		MonitoredDevices: h.registry.Len(),
+		Timestamp:        time.Now().UTC(),
+	})
+}
+
+// handleReadiness returns whether the Monitoring Service is ready to monitor devices and publish events.
+func (h *Handler) handleReadiness(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	dependencies := make(map[string]string)
+	ready := true
+
+	// Check Kafka dependency
+	if h.kafkaEnabled {
+		kafkaAvailable := false
+		for _, broker := range h.kafkaBrokers {
+			conn, err := net.DialTimeout("tcp", broker, 500*time.Millisecond)
+			if err == nil {
+				_ = conn.Close()
+				kafkaAvailable = true
+				break
+			}
+		}
+		if kafkaAvailable {
+			dependencies["kafka"] = "CONNECTED"
+			metrics.KafkaAvailable.Set(1)
+		} else {
+			dependencies["kafka"] = "DISCONNECTED"
+			metrics.KafkaAvailable.Set(0)
+			ready = false
+		}
+	} else {
+		dependencies["kafka"] = "DISABLED"
+	}
+
+	// Check Simulator / Fleet registry initialization
+	if h.registry.Len() == 0 {
+		dependencies["simulator"] = "UNINITIALIZED"
+		ready = false
+	} else {
+		dependencies["simulator"] = "CONFIGURED"
+	}
+
+	uptime := time.Since(h.startTime).Truncate(time.Second).String()
+	statusStr := "READY"
+	httpStatus := http.StatusOK
+	if !ready {
+		statusStr = "NOT_READY"
+		httpStatus = http.StatusServiceUnavailable
+	}
+
+	writeJSON(w, httpStatus, ReadinessHealth{
+		Status:           statusStr,
+		Uptime:           uptime,
+		MonitoredDevices: h.registry.Len(),
+		Dependencies:     dependencies,
 		Timestamp:        time.Now().UTC(),
 	})
 }

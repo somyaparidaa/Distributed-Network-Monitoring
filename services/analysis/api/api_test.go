@@ -94,6 +94,56 @@ func TestHealthEndpoint(t *testing.T) {
 	}
 }
 
+func TestAnalysisLiveAndReadinessEndpoints(t *testing.T) {
+	repo := store.NewMemoryRepository()
+	windows := map[string]time.Duration{"1m": 1 * time.Minute}
+	handler := NewHandler(repo, false, true, windows)
+
+	// 1. Live probe returns 200 UP
+	reqLive := httptest.NewRequest(http.MethodGet, "/health/live", nil)
+	recLive := httptest.NewRecorder()
+	handler.Routes().ServeHTTP(recLive, reqLive)
+	if recLive.Code != http.StatusOK {
+		t.Fatalf("expected 200 from /health/live, got %d", recLive.Code)
+	}
+
+	// 2. Ready probe with healthy redis returns 200 READY
+	reqReady := httptest.NewRequest(http.MethodGet, "/health/ready", nil)
+	recReady := httptest.NewRecorder()
+	handler.Routes().ServeHTTP(recReady, reqReady)
+	if recReady.Code != http.StatusOK {
+		t.Fatalf("expected 200 from /health/ready, got %d", recReady.Code)
+	}
+	var shReady ServiceHealth
+	if err := json.Unmarshal(recReady.Body.Bytes(), &shReady); err != nil {
+		t.Fatalf("decode ready: %v", err)
+	}
+	if shReady.Status != "READY" || shReady.Dependencies["redis"] != "CONNECTED" {
+		t.Fatalf("unexpected ready response: %+v", shReady)
+	}
+
+	// 3. When Redis fails, /health/ready returns 503 NOT_READY while /health/live remains 200 UP
+	_ = repo.Close()
+	recReadyDown := httptest.NewRecorder()
+	handler.Routes().ServeHTTP(recReadyDown, reqReady)
+	if recReadyDown.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 from /health/ready when redis down, got %d", recReadyDown.Code)
+	}
+	var shDown ServiceHealth
+	if err := json.Unmarshal(recReadyDown.Body.Bytes(), &shDown); err != nil {
+		t.Fatalf("decode ready down: %v", err)
+	}
+	if shDown.Status != "NOT_READY" || shDown.Dependencies["redis"] != "DISCONNECTED" {
+		t.Fatalf("unexpected ready down: %+v", shDown)
+	}
+
+	recLiveStillUp := httptest.NewRecorder()
+	handler.Routes().ServeHTTP(recLiveStillUp, reqLive)
+	if recLiveStillUp.Code != http.StatusOK {
+		t.Fatalf("expected 200 from /health/live even when redis down, got %d", recLiveStillUp.Code)
+	}
+}
+
 func TestAnalysisMetricsEndpoint(t *testing.T) {
 	handler, _ := setupTestHandler()
 

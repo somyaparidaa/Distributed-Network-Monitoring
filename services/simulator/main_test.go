@@ -690,6 +690,64 @@ func TestRouterTelemetryRoutesPreserved(t *testing.T) {
 	}
 }
 
+func TestSimulatorHealthAndReadinessEndpoints(t *testing.T) {
+	fleet := newTestFleet(t)
+	handler, err := NewMux(fleet)
+	if err != nil {
+		t.Fatalf("NewMux failed: %v", err)
+	}
+
+	// 1. GET /health (legacy)
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /health returned %d, want 200", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `"status":"UP"`) {
+		t.Fatalf("GET /health body = %s, want status UP", rec.Body.String())
+	}
+
+	// 2. GET /health/live
+	reqLive := httptest.NewRequest(http.MethodGet, "/health/live", nil)
+	recLive := httptest.NewRecorder()
+	handler.ServeHTTP(recLive, reqLive)
+	if recLive.Code != http.StatusOK {
+		t.Fatalf("GET /health/live returned %d, want 200", recLive.Code)
+	}
+	if !strings.Contains(recLive.Body.String(), `"status":"UP"`) {
+		t.Fatalf("GET /health/live body = %s, want status UP", recLive.Body.String())
+	}
+
+	// 3. GET /health/ready
+	reqReady := httptest.NewRequest(http.MethodGet, "/health/ready", nil)
+	recReady := httptest.NewRecorder()
+	handler.ServeHTTP(recReady, reqReady)
+	if recReady.Code != http.StatusOK {
+		t.Fatalf("GET /health/ready returned %d, want 200", recReady.Code)
+	}
+	if !strings.Contains(recReady.Body.String(), `"status":"READY"`) {
+		t.Fatalf("GET /health/ready body = %s, want status READY", recReady.Body.String())
+	}
+
+	// 4. Method not allowed
+	reqPost := httptest.NewRequest(http.MethodPost, "/health/ready", nil)
+	recPost := httptest.NewRecorder()
+	handler.ServeHTTP(recPost, reqPost)
+	if recPost.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("POST /health/ready returned %d, want 405", recPost.Code)
+	}
+
+	// 5. Individual simulated device failure does NOT cause simulator service readiness to fail
+	r1, _ := fleet.Device("router-01")
+	r1.SetDown(true)
+	recReadyAfterDown := httptest.NewRecorder()
+	handler.ServeHTTP(recReadyAfterDown, reqReady)
+	if recReadyAfterDown.Code != http.StatusOK {
+		t.Fatalf("GET /health/ready after router-01 failure returned %d, want 200", recReadyAfterDown.Code)
+	}
+}
+
 func newTestFleet(t *testing.T) *Fleet {
 	t.Helper()
 	fleet, err := NewFleet([]DeviceConfig{

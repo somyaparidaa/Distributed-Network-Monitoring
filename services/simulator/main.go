@@ -425,10 +425,32 @@ func NewMux(fleet *Fleet) (http.Handler, error) {
 	updateFleetConditionGauges(fleet)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+	liveHandler := func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"status":"UP"}`))
+	}
+	mux.HandleFunc("/health", liveHandler)
+	mux.HandleFunc("/health/live", liveHandler)
+	mux.HandleFunc("/health/ready", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if _, exists := fleet.Device("router-01"); !exists {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"status":"NOT_READY","error":"primary device router-01 not initialized"}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"READY","fleet_size":3}`))
 	})
 	promHandler := promhttp.HandlerFor(simReg, promhttp.HandlerOpts{})
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {

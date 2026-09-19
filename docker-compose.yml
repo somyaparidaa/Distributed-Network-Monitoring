@@ -53,7 +53,7 @@ services:
     environment:
       - SIMULATOR_ADDR=:8080
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/health/ready || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -82,7 +82,7 @@ services:
       - RETRY_BACKOFF=50ms
       - FAILURE_THRESHOLD=3
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8081/health || exit 1"]
+      test: ["CMD-SHELL", "curl -f http://localhost:8081/health/ready || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -111,7 +111,7 @@ services:
       - ANALYSIS_HTTP_ADDR=:8082
       - AGGREGATION_WINDOWS=1m,5m
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8082/health || exit 1"]
+      test: ["CMD-SHELL", "curl -f http://localhost:8082/health/ready || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 5

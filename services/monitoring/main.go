@@ -92,7 +92,7 @@ func NewServiceWithProducer(cfg Config, injectedProducer kafka.Producer) (*Servi
 		engine.SetTelemetryPublisher(kafka.NewEventPublisher(producer))
 	}
 
-	apiHandler := api.NewHandler(registry, store, healthStore, stateTracker)
+	apiHandler := api.NewHandlerWithDependencies(registry, store, healthStore, stateTracker, client, cfg.KafkaEnabled, cfg.KafkaBrokers)
 
 	return &Service{
 		registry:     registry,
